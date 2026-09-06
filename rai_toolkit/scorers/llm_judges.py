@@ -573,11 +573,19 @@ class RetrievalRelevanceScorer(LLMJudgeScorer):
         result = self._call_judge(prompts["system"], user_prompt)
 
         # The judge's own overall score is advisory only; keep it for the
-        # details report but never let it drive the metric.
-        try:
-            judge_score: float | None = float(result.get("score"))
-        except (TypeError, ValueError):
+        # details report but never let it drive the metric. A bool is
+        # rejected outright, not coerced -- float(True) is 1.0 and a
+        # boolean is not a score -- the same typing rule the verdict
+        # indexes follow.
+        raw_judge_score = result.get("score")
+        judge_score: float | None
+        if isinstance(raw_judge_score, bool):
             judge_score = None
+        else:
+            try:
+                judge_score = float(raw_judge_score)
+            except (TypeError, ValueError):
+                judge_score = None
         if judge_score is not None and not math.isfinite(judge_score):
             judge_score = None
 

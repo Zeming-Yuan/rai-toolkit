@@ -549,6 +549,31 @@ def test_contradictory_overall_score_is_derived_from_verdicts() -> None:
     assert result.details["judge_explanation"] == "Perfect retrieval."
 
 
+def test_boolean_judge_score_is_rejected_not_coerced() -> None:
+    # A bool is not a score: float(True) is 1.0, so the advisory judge
+    # score must be dropped rather than silently coerced -- the same
+    # typing rule the verdict chunk indexes follow.
+    scorer = _scorer(
+        {
+            "score": True,
+            "explanation": "Perfect retrieval.",
+            "chunk_verdicts": [
+                {"chunk_index": 0, "relevance": "relevant", "reason": "On topic."},
+            ],
+        }
+    )
+
+    result = scorer.score(
+        "What is the revenue?",
+        input="What is the revenue?",
+        context="[fin-1] Revenue was $10 million.",
+    )
+
+    assert result.assessed
+    assert result.score == 1.0
+    assert result.details["judge_score"] is None
+
+
 def test_template_json_example_is_parseable() -> None:
     # The template goes through a single .format() call, so any literal brace
     # in the JSON example must be doubled exactly once. A doubled-twice brace

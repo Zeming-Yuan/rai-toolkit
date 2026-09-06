@@ -574,6 +574,95 @@ def test_boolean_judge_score_is_rejected_not_coerced() -> None:
     assert result.details["judge_score"] is None
 
 
+def test_chunk_containing_delimiter_stays_one_envelope() -> None:
+    # A labelled chunk may itself contain the "---" delimiter. The judge sees
+    # numbered <chunk index="N"> envelopes, not a delimiter join, so the
+    # in-chunk delimiter cannot read as a boundary and create a phantom
+    # section a third verdict could grade.
+    scorer = _scorer(
+        {
+            "score": 3,
+            "explanation": "Fine.",
+            "chunk_verdicts": [
+                {"chunk_index": 0, "relevance": "relevant", "reason": "On topic."},
+                {"chunk_index": 1, "relevance": "irrelevant", "reason": "Off topic."},
+                {"chunk_index": 2, "relevance": "irrelevant", "reason": "Phantom section."},
+            ],
+        }
+    )
+
+    result = scorer.score(
+        "What is the revenue?",
+        input="What is the revenue?",
+        context=(
+            "[fin-1] Revenue was $10M --- audited figure\n\n"
+            "[fin-2] Weather only"
+        ),
+    )
+
+    assert result.assessed
+    assert result.details["total_chunks"] == 2
+    # The extra verdict for the phantom third section is discarded as
+    # off-scale and never graded.
+    assert result.details["discarded_verdicts"] == 1
+    assert result.details["relevant_chunks"] == 1
+    assert result.details["raw_score"] == 1
+    judge_prompt = scorer._call_judge.call_args[0][1]
+    # Count real envelope openings only: the template prose also mentions
+    # <chunk index="N"> with a literal N.
+    assert len(re.findall(r'<chunk index="\d+">', judge_prompt)) == 2
+    # The full first chunk, delimiter included, stays inside one envelope.
+    first_envelope = '<chunk index="0">\n[fin-1] Revenue was $10M --- audited figure\n</chunk>'
+    second_envelope = '<chunk index="1">\n[fin-2] Weather only\n</chunk>'
+    assert first_envelope in judge_prompt
+    assert second_envelope in judge_prompt
+
+
+def test_non_object_json_reply_is_controlled_unassessed() -> None:
+    # Valid JSON with a non-object top level (null, a list, a string, a
+    # number) is not a judge reply: the row must come back un-assessed with
+    # the reply kept for audit, never an AttributeError from the field reads.
+    for bad_reply in (None, [1, 2], "cannot grade", 7):
+        scorer = _scorer(bad_reply)
+
+        result = scorer.score(
+            "What is the revenue?",
+            input="What is the revenue?",
+            context="[fin-1] Revenue was $10 million.",
+        )
+
+        assert not result.assessed, bad_reply
+        assert result.details["skipped"] == "judge_parse_failure", bad_reply
+        assert result.details["judge_response"] == bad_reply, bad_reply
+
+
+def test_parse_failure_reply_is_strict_json_serializable() -> None:
+    # Python's JSON parser accepts NaN/Infinity literals, so a parse-failure
+    # reply can carry non-finite floats. They are sanitized recursively, so
+    # the strict-serialization contract (json.dumps with allow_nan=False)
+    # holds on the audit record.
+    bad_reply = {
+        "score": float("nan"),
+        "explanation": "garbage",
+        "chunk_verdicts": [
+            {"chunk_index": float("inf"), "relevance": "relevant"},
+        ],
+    }
+    scorer = _scorer(bad_reply)
+
+    result = scorer.score(
+        "What is the revenue?",
+        input="What is the revenue?",
+        context="[fin-1] Revenue was $10 million.\n[fin-2] Weather only",
+    )
+
+    assert not result.assessed
+    stored = result.details["judge_response"]
+    assert stored["score"] == "NaN"
+    assert stored["chunk_verdicts"][0]["chunk_index"] == "Infinity"
+    json.dumps(result.details, allow_nan=False)
+
+
 def test_template_json_example_is_parseable() -> None:
     # The template goes through a single .format() call, so any literal brace
     # in the JSON example must be doubled exactly once. A doubled-twice brace

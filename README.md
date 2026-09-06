@@ -374,6 +374,10 @@ Available judge scorers include `FactualityJudge`, `FairnessJudge`,
 `ExplainabilityJudge`, `RubricScorer`, and `GroundednessScorer`. The
 `GroundednessScorer` evaluates RAG responses only when retrieved context is
 present and retains verified supporting or contradicting spans as evidence.
+The `RetrievalRelevanceScorer` grades retrieval quality itself: it validates
+the judge's per-chunk relevance verdicts against the parsed chunks, derives
+the overall score from them, and returns un-assessed rather than silently
+passing when the judge reply cannot be trusted.
 
 ## Weave-native evaluation in assessment
 

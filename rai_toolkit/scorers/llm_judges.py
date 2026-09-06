@@ -463,17 +463,42 @@ def _split_context_chunks(context: str) -> list[str]:
     return [c for c in text.split("---") if c.strip()]
 
 
+def _sanitize_judge_value(value: Any) -> Any:
+    """Return a JSON-strict copy of a judge reply for the audit record.
+
+    Python's JSON parser accepts NaN/Infinity literals, so a raw reply can
+    carry non-finite floats that break strict serialization
+    (``json.dumps(..., allow_nan=False)``). Non-finite floats are replaced
+    recursively with their string form, so the audit record keeps the
+    information without breaking the contract.
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        if math.isnan(value):
+            return "NaN"
+        return "Infinity" if value > 0 else "-Infinity"
+    if isinstance(value, dict):
+        return {key: _sanitize_judge_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_judge_value(item) for item in value]
+    return value
+
+
 def _render_context_chunks(chunks: list[str]) -> str:
-    """Render the parsed chunk sequence back into the context the judge sees.
+    """Render the parsed chunk sequence into the envelopes the judge sees.
 
     The judge prompt must be built from the exact chunk sequence the scorer
     grades: anything the parser dropped (e.g. text before the first labelled
     block) must not reach the judge, or the judge's chunk indexes would shift
-    relative to the chunks the scorer counted. ``---`` is a valid separator
-    under either contract, so labelled and delimiter chunks both re-render
-    into the format the prompt describes.
+    relative to the chunks the scorer counted. Each chunk is wrapped in a
+    numbered ``<chunk index="N">`` envelope instead of being joined with
+    ``---``: the delimiter is valid content under either contract, so a chunk
+    containing it would otherwise render as extra delimiter-shaped sections
+    a third verdict could grade.
     """
-    return "\n---\n".join(chunks)
+    return "\n\n".join(
+        f'<chunk index="{position}">\n{chunk}\n</chunk>'
+        for position, chunk in enumerate(chunks)
+    )
 
 
 class RetrievalRelevanceScorer(LLMJudgeScorer):
@@ -482,7 +507,9 @@ class RetrievalRelevanceScorer(LLMJudgeScorer):
     Designed for RAG retrieval quality evaluation. Chunks follow the toolkit's
     context contract: line-start ``[source-id] text`` blocks, the format the
     reference RAG apps emit, with literal ``---`` delimiters accepted as a
-    fallback for unlabeled contexts. The judge assigns a per-chunk relevance
+    fallback for unlabeled contexts. The judge reads the chunks re-rendered
+    into numbered ``<chunk index="N">`` envelopes, so a delimiter inside a
+    chunk can never read as a boundary. The judge assigns a per-chunk relevance
     verdict and the scorer derives the overall 0-3 score from the validated
     verdicts, then normalizes to 0-1.
 
@@ -571,6 +598,29 @@ class RetrievalRelevanceScorer(LLMJudgeScorer):
             output=output, input=input, context=parsed_context
         )
         result = self._call_judge(prompts["system"], user_prompt)
+        if not isinstance(result, dict):
+            # Valid JSON with a non-object top level (null, a list, a string,
+            # a number) is not a judge reply: return a controlled un-assessed
+            # result instead of crashing on the field reads below. The reply
+            # is sanitized and kept in details for audit.
+            return ScorerResult(
+                score=0.0,
+                passed=False,
+                category=self.category,
+                explanation=(
+                    "Un-assessed: the judge reply was valid JSON but not an "
+                    "object, so it carries no per-chunk verdicts. Inspect "
+                    "details.judge_response to see what the judge returned."
+                ),
+                details={
+                    "skipped": "judge_parse_failure",
+                    "scorer_name": self.name,
+                    "judge_model": self.model,
+                    "judge_response": _sanitize_judge_value(result),
+                    "total_chunks": len(chunks),
+                },
+                assessed=False,
+            )
 
         # The judge's own overall score is advisory only; keep it for the
         # details report but never let it drive the metric. A bool is
@@ -644,7 +694,7 @@ class RetrievalRelevanceScorer(LLMJudgeScorer):
                     "skipped": "judge_parse_failure",
                     "scorer_name": self.name,
                     "judge_model": self.model,
-                    "judge_response": result,
+                    "judge_response": _sanitize_judge_value(result),
                     "total_chunks": len(chunks),
                     "covered_chunks": len(valid_verdicts),
                     "duplicate_chunk_indexes": sorted(set(duplicate_indexes)),
@@ -668,7 +718,7 @@ class RetrievalRelevanceScorer(LLMJudgeScorer):
                     "skipped": "judge_parse_failure",
                     "scorer_name": self.name,
                     "judge_model": self.model,
-                    "judge_response": result,
+                    "judge_response": _sanitize_judge_value(result),
                     "total_chunks": len(chunks),
                     "covered_chunks": len(valid_verdicts),
                     "missing_chunk_indexes": missing_indexes,

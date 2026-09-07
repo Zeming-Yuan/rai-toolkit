@@ -430,10 +430,13 @@ class GroundednessScorer(LLMJudgeScorer):
 # passage is never mistaken for a new chunk boundary, and whitespace (or end
 # of line) must follow the bracket so a Markdown link like
 # "[docs](https://example.com)" at the start of a line is never read as a
-# source label. Character set matches the source-id style the reference RAG
-# apps emit (e.g. "general-disclaimer").
+# source label. The whitespace around the ID is horizontal only ([ \t]*):
+# \s includes newlines, so "[\nfin-1]" would otherwise read as a label and
+# collapse a multi-section context into one labelled chunk. Character set
+# matches the source-id style the reference RAG apps emit
+# (e.g. "general-disclaimer").
 _SOURCE_LABEL_PATTERN = re.compile(
-    r"^\[\s*([A-Za-z0-9][A-Za-z0-9._\-]*)\s*\](?=\s|$)", re.MULTILINE
+    r"^\[([A-Za-z0-9][A-Za-z0-9._\-]*)[ \t]*\](?=\s|$)", re.MULTILINE
 )
 
 

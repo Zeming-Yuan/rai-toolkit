@@ -470,6 +470,32 @@ def test_markdown_link_at_line_start_is_not_a_source_label() -> None:
     assert result.details["discarded_verdicts"] == 0
 
 
+def test_bracket_before_newline_is_not_a_source_label() -> None:
+    # "\s" includes newlines, so "[" followed by a newline and then "fin-1]"
+    # once read as a labelled block -- collapsing a two-section delimiter
+    # context into one labelled chunk and letting a single relevant verdict
+    # pass. The whitespace around the ID is horizontal only, so this context
+    # has no label at all and falls back to the "---" delimiter split.
+    scorer = _scorer(
+        {
+            "score": 3,
+            "chunk_verdicts": [
+                {"chunk_index": 0, "relevance": "relevant", "reason": "On topic."},
+                {"chunk_index": 1, "relevance": "relevant", "reason": "On topic."},
+            ],
+        }
+    )
+
+    result = scorer.score(
+        "What is the revenue?",
+        input="What is the revenue?",
+        context="[\nfin-1] Revenue was $10M\n---\nWeather only",
+    )
+
+    assert result.assessed
+    assert result.details["total_chunks"] == 2
+
+
 def test_labelled_context_takes_precedence_over_delimiters() -> None:
     # When line-start labels are present, the contract is the labelled-block
     # format; a literal "---" inside a passage does not split anything.

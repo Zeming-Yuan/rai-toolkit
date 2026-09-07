@@ -189,7 +189,9 @@ def test_success_details_omit_raw_judge_response() -> None:
 
 def test_total_chunks_come_from_the_context_not_the_judge() -> None:
     # A judge that invents extra verdicts (here: chunk_index 7) must not be
-    # able to inflate the reported chunk counts.
+    # able to inflate the reported chunk counts -- and an invented index
+    # claims a chunk the context does not contain, so it is a parse failure
+    # (like a duplicate), not a discard.
     scorer = _scorer(
         {
             "score": 3,
@@ -205,8 +207,8 @@ def test_total_chunks_come_from_the_context_not_the_judge() -> None:
     assert not result.assessed
     assert result.details["skipped"] == "judge_parse_failure"
     assert result.details["total_chunks"] == 2
-    assert result.details["missing_chunk_indexes"] == [1]
-    assert result.details["discarded_verdicts"] == 1
+    assert result.details["out_of_range_chunk_indexes"] == [7]
+    assert result.details["discarded_verdicts"] == 0
     assert "judge_response" in result.details
 
 
@@ -301,6 +303,38 @@ def test_duplicate_with_unrecognized_label_is_still_a_parse_failure() -> None:
     assert result.details["skipped"] == "judge_parse_failure"
     assert result.details["duplicate_chunk_indexes"] == [0]
     assert result.details["discarded_verdicts"] == 1
+
+
+def test_out_of_range_indexes_are_a_parse_failure() -> None:
+    # An integer index outside the real chunk range claims a chunk the
+    # context does not contain: discarding it would still assess the row
+    # (every real index covered, phantom verdict silently dropped), so it
+    # fails the parse like a duplicate index does. All offending indexes are
+    # recorded -- negatives included -- while the in-range verdicts are not
+    # graded at all.
+    scorer = _scorer(
+        {
+            "score": 3,
+            "chunk_verdicts": [
+                {"chunk_index": 0, "relevance": "relevant", "reason": "On topic."},
+                {"chunk_index": 5, "relevance": "relevant", "reason": "Phantom."},
+                {"chunk_index": -1, "relevance": "relevant", "reason": "Negative."},
+            ],
+        }
+    )
+
+    result = scorer.score(
+        "What is the revenue?",
+        input="What is the revenue?",
+        context="Revenue was $10M --- Weather forecast",
+    )
+
+    assert not result.assessed
+    assert result.details["skipped"] == "judge_parse_failure"
+    assert result.details["total_chunks"] == 2
+    assert result.details["out_of_range_chunk_indexes"] == [-1, 5]
+    assert result.details["discarded_verdicts"] == 0
+    assert "judge_response" in result.details
 
 
 def test_unknown_relevance_label_is_a_parse_failure() -> None:
@@ -626,13 +660,13 @@ def test_chunk_containing_delimiter_stays_one_envelope() -> None:
         ),
     )
 
-    assert result.assessed
+    assert not result.assessed
+    assert result.details["skipped"] == "judge_parse_failure"
     assert result.details["total_chunks"] == 2
-    # The extra verdict for the phantom third section is discarded as
-    # off-scale and never graded.
-    assert result.details["discarded_verdicts"] == 1
-    assert result.details["relevant_chunks"] == 1
-    assert result.details["raw_score"] == 1
+    # The phantom index 2 claims a chunk the context does not contain: that
+    # is a parse failure, not a discard -- discarding it would still assess
+    # the row while a phantom verdict is in play.
+    assert result.details["out_of_range_chunk_indexes"] == [2]
     judge_prompt = scorer._call_judge.call_args[0][1]
     # Count real envelope openings only: the template prose also mentions
     # <chunk index="N"> with a literal N.

@@ -532,13 +532,17 @@ class RetrievalRelevanceScorer(LLMJudgeScorer):
     verdicts, then normalizes to 0-1.
 
     The chunk count is taken from the context itself, not from the judge.
-    Verdicts that are not dicts, carry an out-of-range ``chunk_index``, a
-    non-integer ``chunk_index``, or an unrecognized relevance label are
-    discarded and reported in ``details["discarded_verdicts"]``. A duplicated
-    ``chunk_index`` fails the parse (the chunk is ambiguous, so no verdict
-    order can be trusted) and the row is returned un-assessed with
-    ``skipped="judge_parse_failure"``. If any real chunk lacks a verdict, the
-    row is also un-assessed rather than silently passing. The judge's own
+    Verdicts that are not dicts, carry a non-integer ``chunk_index``, or an
+    unrecognized relevance label are discarded and reported in
+    ``details["discarded_verdicts"]``. A duplicated ``chunk_index`` or an
+    integer ``chunk_index`` outside the real chunk range fails the parse
+    (either way the per-chunk grading is ambiguous: which verdict graded
+    what?) and the row is returned un-assessed with
+    ``skipped="judge_parse_failure"``, with the offending indexes recorded in
+    ``details["duplicate_chunk_indexes"]`` /
+    ``details["out_of_range_chunk_indexes"]``. If any real chunk lacks a
+    verdict, the row is also un-assessed rather than silently passing. The
+    judge's own
     overall score is advisory and recorded in ``details["judge_score"]``; the
     returned score always follows the validated verdicts, and the returned
     explanation is derived from them too (``details["judge_explanation"]``
@@ -669,6 +673,7 @@ class RetrievalRelevanceScorer(LLMJudgeScorer):
         valid_verdicts: dict[int, dict[str, Any]] = {}
         seen_indexes: set[int] = set()
         duplicate_indexes: list[int] = []
+        out_of_range_indexes: list[int] = []
         discarded_verdicts = 0
         raw_verdicts = result.get("chunk_verdicts")
         if isinstance(raw_verdicts, list):
@@ -681,8 +686,15 @@ class RetrievalRelevanceScorer(LLMJudgeScorer):
                     discarded_verdicts += 1
                     continue
                 index = raw_index
+                # An integer index outside the real chunk range claims a chunk
+                # the context does not contain -- the same ambiguity a
+                # duplicate index creates (which verdict graded what?), so it
+                # fails the parse instead of being discarded: discarding it
+                # would still assess the row while a phantom verdict is in
+                # play. Type-level rejects above and unrecognized labels
+                # below keep discarding: they claim no chunk at all.
                 if not 0 <= index < len(chunks):
-                    discarded_verdicts += 1
+                    out_of_range_indexes.append(index)
                     continue
                 # Every in-range index counts toward ambiguity, even a verdict
                 # that later fails the label check: chunk 0 judged twice is
@@ -697,16 +709,17 @@ class RetrievalRelevanceScorer(LLMJudgeScorer):
                     continue
                 valid_verdicts[index] = verdict
 
-        if duplicate_indexes:
+        if duplicate_indexes or out_of_range_indexes:
             return ScorerResult(
                 score=0.0,
                 passed=False,
                 category=self.category,
                 explanation=(
-                    "Un-assessed: the judge returned more than one verdict for "
-                    "the same chunk. A duplicated chunk_index makes the chunk "
-                    "ambiguous; inspect details.judge_response to see what the "
-                    "judge returned."
+                    "Un-assessed: the judge returned a verdict for a chunk "
+                    "outside the parsed range or more than one verdict for "
+                    "the same chunk. Either makes the per-chunk grading "
+                    "ambiguous; inspect details.judge_response to see what "
+                    "the judge returned."
                 ),
                 details={
                     "skipped": "judge_parse_failure",
@@ -716,6 +729,7 @@ class RetrievalRelevanceScorer(LLMJudgeScorer):
                     "total_chunks": len(chunks),
                     "covered_chunks": len(valid_verdicts),
                     "duplicate_chunk_indexes": sorted(set(duplicate_indexes)),
+                    "out_of_range_chunk_indexes": sorted(set(out_of_range_indexes)),
                     "discarded_verdicts": discarded_verdicts,
                 },
                 assessed=False,

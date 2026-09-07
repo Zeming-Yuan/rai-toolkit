@@ -483,6 +483,19 @@ def _sanitize_judge_value(value: Any) -> Any:
     return value
 
 
+def _escape_chunk_content(chunk: str) -> str:
+    """Neutralize envelope syntax inside chunk content.
+
+    A retrieved chunk may contain literal ``<chunk ...>`` or ``</chunk>``
+    text. Unescaped, it closes the real envelope and forges another indexed
+    one, so a verdict reply grades the forged section instead of the real
+    chunk. Standard XML escaping (ampersand first) makes every such marker
+    inert: the judge still reads the passage, but no bare ``<`` can open a
+    tag, so the prompt contains exactly one envelope per chunk.
+    """
+    return chunk.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def _render_context_chunks(chunks: list[str]) -> str:
     """Render the parsed chunk sequence into the envelopes the judge sees.
 
@@ -493,10 +506,12 @@ def _render_context_chunks(chunks: list[str]) -> str:
     numbered ``<chunk index="N">`` envelope instead of being joined with
     ``---``: the delimiter is valid content under either contract, so a chunk
     containing it would otherwise render as extra delimiter-shaped sections
-    a third verdict could grade.
+    a third verdict could grade. Chunk content is XML-escaped first, so
+    envelope-shaped text inside a chunk can neither close the real envelope
+    nor forge another one.
     """
     return "\n\n".join(
-        f'<chunk index="{position}">\n{chunk}\n</chunk>'
+        f'<chunk index="{position}">\n{_escape_chunk_content(chunk)}\n</chunk>'
         for position, chunk in enumerate(chunks)
     )
 

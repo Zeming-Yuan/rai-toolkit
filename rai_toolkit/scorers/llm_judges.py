@@ -824,6 +824,515 @@ class RetrievalRelevanceScorer(LLMJudgeScorer):
         )
 
 
+def _advisory_judge_score(raw_score: Any) -> float | None:
+    """Parse the judge's own overall score as an advisory audit value.
+
+    The scorers below always derive their score from validated verdicts; the
+    judge's own number is recorded in ``details["judge_score"]`` only. A bool is
+    rejected rather than coerced (``float(True)`` is 1.0 and a boolean is not a
+    score), and an unparseable or non-finite value becomes ``None``.
+    """
+    if isinstance(raw_score, bool):
+        return None
+    try:
+        score = float(raw_score)
+    except (TypeError, ValueError):
+        return None
+    return score if math.isfinite(score) else None
+
+
+class ContextPrecisionScorer(LLMJudgeScorer):
+    """Measure the fraction of retrieved chunks the query actually needed.
+
+    Precision is a set-level measurement, not a per-chunk grade: it answers "of
+    the chunks that were retrieved, how many were actually needed to answer the
+    query", so a retriever that pads the context window with redundant or
+    off-topic chunks scores low even when every chunk is individually on topic.
+    That is the difference from ``RetrievalRelevanceScorer``, which grades each
+    chunk on its own and therefore cannot see redundancy across chunks.
+
+    Chunks follow the toolkit's context contract (see
+    ``_split_context_chunks``) and the judge reads them re-rendered into
+    numbered ``<chunk index="N">`` envelopes. The judge returns a binary
+    ``needed`` / ``not_needed`` verdict per chunk, and the scorer derives the
+    score as ``needed / total`` from the validated verdicts. The judge's own
+    overall score is advisory and recorded in ``details["judge_score"]``.
+
+    Verdicts that are not dicts, carry a non-integer ``chunk_index``, or an
+    unrecognized label are discarded and reported in
+    ``details["discarded_verdicts"]``. A duplicated or out-of-range
+    ``chunk_index``, or a real chunk with no verdict, fails the parse (the
+    per-chunk grading would be ambiguous) and the row is returned un-assessed
+    with ``skipped="judge_parse_failure"``.
+
+    Rows without retrieved context or with a blank query return
+    ``assessed=False``. Refusal-shaped rows are still assessed: this scorer
+    grades the retriever, and retrieved context remains gradable even when the
+    generator declines to answer.
+    """
+
+    name = "ContextPrecisionScorer"
+    description = (
+        "Measures the fraction of retrieved context chunks the query actually needed"
+    )
+    category = "MIT-3.1"
+    _judge_name = "ContextPrecisionScorer"
+
+    def score(
+        self,
+        output: str,
+        input: str = "",
+        context: str = "",
+        **kwargs: Any,
+    ) -> ScorerResult:
+        # Chunk count comes from the context, never from the judge's verdict
+        # list: the scorer and the judge must agree on what was retrieved.
+        chunks = _split_context_chunks(context)
+        if not chunks:
+            return ScorerResult(
+                score=0.0,
+                passed=False,
+                category=self.category,
+                explanation=(
+                    "Un-assessed: no retrieved context is available. "
+                    "ContextPrecisionScorer measures how much of the retrieved "
+                    "set was needed; without context there is nothing to assess."
+                ),
+                details={
+                    "skipped": "empty_context",
+                    "scorer_name": self.name,
+                    "judge_model": self.model,
+                },
+                assessed=False,
+            )
+        if not (input or "").strip():
+            return ScorerResult(
+                score=0.0,
+                passed=False,
+                category=self.category,
+                explanation=(
+                    "Un-assessed: no user query available. Context precision "
+                    "asks whether chunks were needed to answer the query; with "
+                    "a blank query there is nothing for a chunk to be needed for."
+                ),
+                details={
+                    "skipped": "empty_query",
+                    "scorer_name": self.name,
+                    "judge_model": self.model,
+                },
+                assessed=False,
+            )
+
+        prompts = self._get_prompts()
+        # Rebuild the prompt from the exact parsed chunk sequence so the judge's
+        # indexes line up with the chunks the scorer counts.
+        parsed_context = _render_context_chunks(chunks)
+        user_prompt = self._format_prompt(
+            output=output, input=input, context=parsed_context
+        )
+        result = self._call_judge(prompts["system"], user_prompt)
+        if not isinstance(result, dict):
+            return ScorerResult(
+                score=0.0,
+                passed=False,
+                category=self.category,
+                explanation=(
+                    "Un-assessed: the judge reply was valid JSON but not an "
+                    "object, so it carries no per-chunk verdicts. Inspect "
+                    "details.judge_response to see what the judge returned."
+                ),
+                details={
+                    "skipped": "judge_parse_failure",
+                    "scorer_name": self.name,
+                    "judge_model": self.model,
+                    "judge_response": _sanitize_judge_value(result),
+                    "total_chunks": len(chunks),
+                },
+                assessed=False,
+            )
+
+        judge_score = _advisory_judge_score(result.get("score"))
+
+        recognized_labels = ("needed", "not_needed")
+        valid_verdicts: dict[int, dict[str, Any]] = {}
+        seen_indexes: set[int] = set()
+        duplicate_indexes: list[int] = []
+        out_of_range_indexes: list[int] = []
+        discarded_verdicts = 0
+        raw_verdicts = result.get("chunk_verdicts")
+        if isinstance(raw_verdicts, list):
+            for verdict in raw_verdicts:
+                if not isinstance(verdict, dict):
+                    discarded_verdicts += 1
+                    continue
+                raw_index = verdict.get("chunk_index")
+                if isinstance(raw_index, bool) or not isinstance(raw_index, int):
+                    discarded_verdicts += 1
+                    continue
+                index = raw_index
+                if not 0 <= index < len(chunks):
+                    out_of_range_indexes.append(index)
+                    continue
+                if index in seen_indexes:
+                    duplicate_indexes.append(index)
+                    discarded_verdicts += 1
+                    continue
+                seen_indexes.add(index)
+                if verdict.get("needed") not in recognized_labels:
+                    discarded_verdicts += 1
+                    continue
+                valid_verdicts[index] = verdict
+
+        if duplicate_indexes or out_of_range_indexes:
+            return ScorerResult(
+                score=0.0,
+                passed=False,
+                category=self.category,
+                explanation=(
+                    "Un-assessed: the judge returned a verdict for a chunk "
+                    "outside the parsed range or more than one verdict for the "
+                    "same chunk. Either makes the per-chunk grading ambiguous; "
+                    "inspect details.judge_response to see what the judge "
+                    "returned."
+                ),
+                details={
+                    "skipped": "judge_parse_failure",
+                    "scorer_name": self.name,
+                    "judge_model": self.model,
+                    "judge_response": _sanitize_judge_value(result),
+                    "total_chunks": len(chunks),
+                    "covered_chunks": len(valid_verdicts),
+                    "duplicate_chunk_indexes": sorted(set(duplicate_indexes)),
+                    "out_of_range_chunk_indexes": sorted(set(out_of_range_indexes)),
+                    "discarded_verdicts": discarded_verdicts,
+                },
+                assessed=False,
+            )
+
+        missing_indexes = sorted(set(range(len(chunks))) - set(valid_verdicts))
+        if missing_indexes:
+            return ScorerResult(
+                score=0.0,
+                passed=False,
+                category=self.category,
+                explanation=(
+                    "Un-assessed: the judge did not return a parseable verdict "
+                    "for every chunk. Inspect details.judge_response to see "
+                    "what the judge returned."
+                ),
+                details={
+                    "skipped": "judge_parse_failure",
+                    "scorer_name": self.name,
+                    "judge_model": self.model,
+                    "judge_response": _sanitize_judge_value(result),
+                    "total_chunks": len(chunks),
+                    "covered_chunks": len(valid_verdicts),
+                    "missing_chunk_indexes": missing_indexes,
+                    "discarded_verdicts": discarded_verdicts,
+                },
+                assessed=False,
+            )
+
+        needed_count = sum(
+            1 for v in valid_verdicts.values() if v.get("needed") == "needed"
+        )
+        precision = needed_count / len(chunks)
+        chunk_verdicts = [
+            {
+                "chunk_index": index,
+                "needed": valid_verdicts[index].get("needed"),
+                "reason": str(valid_verdicts[index].get("reason", "")),
+            }
+            for index in sorted(valid_verdicts)
+        ]
+        explanation = (
+            f"{needed_count} of {len(chunks)} retrieved chunk(s) needed; "
+            f"precision {precision:.2f}, threshold {self.threshold}."
+        )
+
+        return ScorerResult(
+            score=precision,
+            passed=ScoreNormalizer.apply_threshold(precision, self.threshold),
+            category=self.category,
+            explanation=explanation,
+            details={
+                "scorer_name": self.name,
+                "raw_score": precision,
+                "max_score": 1,
+                "judge_model": self.model,
+                "chunk_verdicts": chunk_verdicts,
+                "needed_chunks": needed_count,
+                "total_chunks": len(chunks),
+                "discarded_verdicts": discarded_verdicts,
+                "judge_score": judge_score,
+                "judge_explanation": str(result.get("explanation", "")),
+            },
+        )
+
+
+class ContextRecallScorer(LLMJudgeScorer):
+    """Measure how much of the reference answer the retrieved context supplied.
+
+    Recall is a set-level measurement: it answers "of the information needed to
+    answer the query, how much did the retrieval actually supply", so a
+    retriever that misses the one chunk that mattered scores low even when every
+    chunk it did return is relevant. That is the difference from
+    ``RetrievalRelevanceScorer``, which can only grade what was retrieved and is
+    blind to a chunk that was never returned at all.
+
+    The judge decomposes the row's reference answer (``expected``) into
+    individual pieces of information, each anchored to a verbatim span of the
+    reference, and marks each piece ``supported`` or ``not_supported`` with a
+    verbatim context span as evidence. The scorer validates those anchors:
+
+    - A piece whose reference span is not verbatim in ``expected`` is discarded,
+      so a judge cannot invent information the reference does not contain.
+    - A piece whose ``supported`` flag is not a boolean is discarded.
+    - A ``supported`` piece whose context span is not verbatim in the rendered
+      chunk sequence the judge read is counted as not supported, because the
+      support claim cannot be verified.
+    - A duplicated reference span fails the parse: the same information listed
+      twice would otherwise double-count in the denominator.
+
+    The score is ``supported / valid pieces``, derived from the validated items.
+    The judge's own overall score is advisory and recorded in
+    ``details["judge_score"]``. A reply that yields no valid piece is a parse
+    failure rather than a perfect or empty score.
+
+    Rows without retrieved context, with a blank query, or without a reference
+    answer return ``assessed=False`` (``skipped`` is ``empty_context`` /
+    ``empty_query`` / ``missing_reference``): recall needs a reference to
+    measure against, and an absent one is a coverage gap, not a zero. Refusal-
+    shaped rows are still assessed: this scorer grades the retriever.
+    """
+
+    name = "ContextRecallScorer"
+    description = (
+        "Measures how much of the reference answer the retrieved context supplied"
+    )
+    category = "MIT-3.1"
+    _judge_name = "ContextRecallScorer"
+
+    def score(
+        self,
+        output: str,
+        input: str = "",
+        context: str = "",
+        **kwargs: Any,
+    ) -> ScorerResult:
+        expected = str(kwargs.get("expected") or "")
+        chunks = _split_context_chunks(context)
+        if not chunks:
+            return ScorerResult(
+                score=0.0,
+                passed=False,
+                category=self.category,
+                explanation=(
+                    "Un-assessed: no retrieved context is available. "
+                    "ContextRecallScorer measures how much of the reference the "
+                    "retrieval supplied; without context there is nothing to "
+                    "assess."
+                ),
+                details={
+                    "skipped": "empty_context",
+                    "scorer_name": self.name,
+                    "judge_model": self.model,
+                },
+                assessed=False,
+            )
+        if not (input or "").strip():
+            return ScorerResult(
+                score=0.0,
+                passed=False,
+                category=self.category,
+                explanation=(
+                    "Un-assessed: no user query available. Context recall asks "
+                    "whether the retrieved chunks supply the information the "
+                    "query needs; with a blank query there is nothing to "
+                    "measure recall against."
+                ),
+                details={
+                    "skipped": "empty_query",
+                    "scorer_name": self.name,
+                    "judge_model": self.model,
+                },
+                assessed=False,
+            )
+        if not expected.strip():
+            return ScorerResult(
+                score=0.0,
+                passed=False,
+                category=self.category,
+                explanation=(
+                    "Un-assessed: no reference answer available on this row. "
+                    "Context recall measures the retrieved set against the "
+                    "information a correct answer needs; without a reference "
+                    "there is nothing to measure against. Add a reference "
+                    "answer or reference context to assess recall on this row."
+                ),
+                details={
+                    "skipped": "missing_reference",
+                    "scorer_name": self.name,
+                    "judge_model": self.model,
+                },
+                assessed=False,
+            )
+
+        prompts = self._get_prompts()
+        # The judge reads the same rendered chunk envelopes the scorer counts,
+        # and the reference answer verbatim: both anchors are checked against
+        # exactly what the judge was shown.
+        parsed_context = _render_context_chunks(chunks)
+        user_prompt = prompts["template"].format(
+            input=input,
+            context=parsed_context,
+            expected=expected,
+        )
+        result = self._call_judge(prompts["system"], user_prompt)
+        if not isinstance(result, dict):
+            return ScorerResult(
+                score=0.0,
+                passed=False,
+                category=self.category,
+                explanation=(
+                    "Un-assessed: the judge reply was valid JSON but not an "
+                    "object, so it carries no reference items. Inspect "
+                    "details.judge_response to see what the judge returned."
+                ),
+                details={
+                    "skipped": "judge_parse_failure",
+                    "scorer_name": self.name,
+                    "judge_model": self.model,
+                    "judge_response": _sanitize_judge_value(result),
+                    "total_chunks": len(chunks),
+                },
+                assessed=False,
+            )
+
+        judge_score = _advisory_judge_score(result.get("score"))
+
+        valid_items: list[dict[str, Any]] = []
+        seen_spans: set[str] = set()
+        duplicate_spans: list[str] = []
+        discarded_items = 0
+        unverified_support_items = 0
+        raw_items = result.get("reference_items")
+        if isinstance(raw_items, list):
+            for item in raw_items:
+                if not isinstance(item, dict):
+                    discarded_items += 1
+                    continue
+                raw_reference_span = item.get("reference_span")
+                if not isinstance(raw_reference_span, str):
+                    discarded_items += 1
+                    continue
+                reference_span = _verbatim_span(raw_reference_span, expected)
+                if not reference_span:
+                    discarded_items += 1
+                    continue
+                if reference_span in seen_spans:
+                    duplicate_spans.append(reference_span)
+                    discarded_items += 1
+                    continue
+                seen_spans.add(reference_span)
+                supported = item.get("supported")
+                if not isinstance(supported, bool):
+                    discarded_items += 1
+                    continue
+                context_span = ""
+                if supported:
+                    raw_context_span = item.get("context_span")
+                    if isinstance(raw_context_span, str):
+                        context_span = (
+                            _verbatim_span(raw_context_span, parsed_context) or ""
+                        )
+                    if not context_span:
+                        # The judge claims support but cannot show it in the
+                        # retrieved chunks. Downgrade rather than trust it.
+                        supported = False
+                        unverified_support_items += 1
+                valid_items.append(
+                    {
+                        "reference_span": reference_span,
+                        "supported": supported,
+                        "context_span": context_span,
+                        "reason": str(item.get("reason", "")),
+                    }
+                )
+
+        if duplicate_spans:
+            return ScorerResult(
+                score=0.0,
+                passed=False,
+                category=self.category,
+                explanation=(
+                    "Un-assessed: the judge listed the same reference span more "
+                    "than once, which would double-count that piece of "
+                    "information in the recall denominator. Inspect "
+                    "details.judge_response to see what the judge returned."
+                ),
+                details={
+                    "skipped": "judge_parse_failure",
+                    "scorer_name": self.name,
+                    "judge_model": self.model,
+                    "judge_response": _sanitize_judge_value(result),
+                    "total_chunks": len(chunks),
+                    "duplicate_reference_spans": sorted(set(duplicate_spans)),
+                    "discarded_items": discarded_items,
+                },
+                assessed=False,
+            )
+
+        if not valid_items:
+            return ScorerResult(
+                score=0.0,
+                passed=False,
+                category=self.category,
+                explanation=(
+                    "Un-assessed: the judge returned no reference piece that "
+                    "could be verified as verbatim text of the reference "
+                    "answer. Inspect details.judge_response to see what the "
+                    "judge returned."
+                ),
+                details={
+                    "skipped": "judge_parse_failure",
+                    "scorer_name": self.name,
+                    "judge_model": self.model,
+                    "judge_response": _sanitize_judge_value(result),
+                    "total_chunks": len(chunks),
+                    "discarded_items": discarded_items,
+                },
+                assessed=False,
+            )
+
+        supported_count = sum(1 for item in valid_items if item["supported"])
+        recall = supported_count / len(valid_items)
+        explanation = (
+            f"{supported_count} of {len(valid_items)} reference piece(s) "
+            f"supplied; recall {recall:.2f}, threshold {self.threshold}."
+        )
+
+        return ScorerResult(
+            score=recall,
+            passed=ScoreNormalizer.apply_threshold(recall, self.threshold),
+            category=self.category,
+            explanation=explanation,
+            details={
+                "scorer_name": self.name,
+                "raw_score": recall,
+                "max_score": 1,
+                "judge_model": self.model,
+                "reference_items": valid_items,
+                "supported_items": supported_count,
+                "total_items": len(valid_items),
+                "unverified_support_items": unverified_support_items,
+                "discarded_items": discarded_items,
+                "judge_score": judge_score,
+                "judge_explanation": str(result.get("explanation", "")),
+            },
+        )
+
+
 class FairnessJudge(LLMJudgeScorer):
     """Evaluates fairness, bias, and discrimination (MIT-1.1)."""
 

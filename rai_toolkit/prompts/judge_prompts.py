@@ -134,6 +134,95 @@ Respond in JSON format:
   ]
 }}"""
 
+CONTEXT_PRECISION_SCORER_SYSTEM = (
+    "You are a strict retrieval-precision auditor for RAG systems. Your job is to "
+    "decide, for each retrieved context chunk, whether that chunk was actually "
+    "needed to answer the user query. A chunk is needed only if it supplies "
+    "information the query asks for. Judge each chunk against the retrieved set as "
+    "a whole: a chunk that repeats information another retrieved chunk already "
+    "supplies is not needed, even though it is on topic. Precision measures how "
+    "much of the retrieved set was necessary, so redundant or off-topic chunks "
+    "count against it."
+)
+
+CONTEXT_PRECISION_SCORER_TEMPLATE = """Decide whether each retrieved context chunk was needed to answer the user query.
+
+**User Query:** {input}
+
+**Retrieved Context (each retrieved chunk is wrapped in a numbered <chunk index="N">...</chunk> envelope):** {context}
+
+Return a per-chunk verdict. Each chunk is exactly one numbered <chunk index="N"> envelope above; use the envelope's index as the chunk_index.
+Assign each chunk a label:
+- "needed": the chunk supplies information the query asks for that no other retrieved chunk supplies.
+- "not_needed": the chunk is off-topic, or the information it supplies is already covered by another retrieved chunk.
+
+Judge the retrieved set as a whole. A chunk that is on topic but repeats another
+chunk's information is "not_needed": precision asks how much of the retrieved set
+was necessary, not how much of it was on topic.
+
+Score overall precision on a 0-3 scale:
+- 3: Every retrieved chunk was needed.
+- 2: Most chunks were needed, but at least one was redundant or off-topic.
+- 1: At most half of the chunks were needed.
+- 0: No chunk was needed.
+
+Respond in JSON format:
+{{
+  "score": <0-3>,
+  "explanation": "<brief reasoning about how much of the retrieved set was needed>",
+  "chunk_verdicts": [
+    {{"chunk_index": 0, "needed": "needed|not_needed", "reason": "<one short sentence>"}},
+    ...
+  ]
+}}"""
+
+CONTEXT_RECALL_SCORER_SYSTEM = (
+    "You are a strict retrieval-recall auditor for RAG systems. Your job is to "
+    "break a reference answer into the individual pieces of information it "
+    "contains, then decide whether the retrieved context supplies each piece. "
+    "Work only from the reference answer: every piece you list must be copied "
+    "verbatim from it, never paraphrased and never invented. A piece counts as "
+    "supplied only when the retrieved context states it; topically related or "
+    "partially matching content does not count."
+)
+
+CONTEXT_RECALL_SCORER_TEMPLATE = """Decide how much of the reference answer the retrieved context supplies.
+
+**User Query:** {input}
+
+**Retrieved Context (each retrieved chunk is wrapped in a numbered <chunk index="N">...</chunk> envelope):** {context}
+
+**Reference Answer:** {expected}
+
+Break the Reference Answer into its individual pieces of information: separate
+facts, figures, conditions, and recommendations. List each piece with an exact
+verbatim span copied from the Reference Answer. Do not paraphrase and do not add
+pieces the Reference Answer does not state.
+
+For each piece, decide whether the Retrieved Context supplies it:
+- "supported": the retrieved context states this piece of information.
+- "not_supported": the retrieved context does not state it, or states only a
+  related but different fact.
+
+For each supported piece, give an exact verbatim span copied from the Retrieved
+Context that states it. Spans must be copied exactly; do not paraphrase.
+
+Score overall recall on a 0-3 scale:
+- 3: Every piece of information in the reference answer is supplied by the retrieved context.
+- 2: Most pieces are supplied, but at least one is missing.
+- 1: At most half of the pieces are supplied.
+- 0: None of the pieces are supplied.
+
+Respond in JSON format:
+{{
+  "score": <0-3>,
+  "explanation": "<brief reasoning about what was and was not retrieved>",
+  "reference_items": [
+    {{"reference_span": "<exact text copied from the Reference Answer>", "supported": true, "context_span": "<exact text copied from the Retrieved Context>", "reason": "<one short sentence>"}},
+    ...
+  ]
+}}"""
+
 FAIRNESS_JUDGE_SYSTEM = (
     "You are an expert in AI fairness and bias detection. Your job is to evaluate "
     "AI-generated responses for unfair bias, discrimination, or stereotyping related "
@@ -374,5 +463,13 @@ JUDGE_PROMPTS: dict[str, dict[str, str]] = {
     "RetrievalRelevanceScorer": {
         "system": RETRIEVAL_RELEVANCE_SCORER_SYSTEM,
         "template": RETRIEVAL_RELEVANCE_SCORER_TEMPLATE,
+    },
+    "ContextPrecisionScorer": {
+        "system": CONTEXT_PRECISION_SCORER_SYSTEM,
+        "template": CONTEXT_PRECISION_SCORER_TEMPLATE,
+    },
+    "ContextRecallScorer": {
+        "system": CONTEXT_RECALL_SCORER_SYSTEM,
+        "template": CONTEXT_RECALL_SCORER_TEMPLATE,
     },
 }

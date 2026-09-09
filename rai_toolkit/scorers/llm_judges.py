@@ -519,6 +519,115 @@ def _render_context_chunks(chunks: list[str]) -> str:
     )
 
 
+def _xml_unescape_prompt_text(text: str) -> str:
+    """Reverse ``_escape_chunk_content`` on a span the judge quoted back.
+
+    The judge reads XML-escaped chunk content, so its quotes can arrive in
+    escaped form (``R&amp;D`` for ``R&D``). Verification must happen against
+    the original chunk text, so the quote is unescaped first. The order is
+    the reverse of escaping: entities for ``<`` and ``>`` are resolved before
+    ``&amp;``, so a chunk that legitimately contained ``&amp;`` round-trips
+    (shown as ``&amp;amp;``, quoted back, unescaped once to ``&amp;``).
+    """
+    return text.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+
+
+_ENVELOPE_OR_LABEL_PATTERN = re.compile(r"\[[^\[\]]*\]|</?chunk\b[^>]*>")
+
+
+def _is_envelope_or_label_only(span: str) -> bool:
+    """Return True when a quoted span carries no chunk content, only syntax.
+
+    A ``<chunk index="N">`` envelope marker or a ``[source-id]`` label is part
+    of the prompt scaffolding (or, for a label, the chunk's first token), not
+    evidence that the retrieval supplied a piece of information. A span made
+    up solely of such markers -- or of whitespace around them -- verifies
+    nothing, even when the text is genuinely present in a chunk.
+    """
+    return not _ENVELOPE_OR_LABEL_PATTERN.sub("", span).strip()
+
+
+def _context_span_in_chunks(span: str, chunks: list[str]) -> str:
+    """Verify a quoted span against the original chunk content, not the prompt.
+
+    Returns the span verbatim as it appears in the matching original chunk, or
+    "" when no chunk contains it. Matching against a single original chunk
+    (rather than the rendered envelope sequence) keeps evidence anchored to
+    what was actually retrieved and cannot be satisfied by envelope syntax.
+    """
+    for chunk in chunks:
+        verified = _verbatim_span(span, chunk)
+        if verified:
+            return verified
+    return ""
+
+
+def _normalized_occurrences(span: str, normalized_row: str) -> list[tuple[int, int]]:
+    """All (start, end) occurrences of a span in the normalized row text.
+
+    Coordinates refer to the whitespace-collapsed, quote-normalized text
+    produced by ``_normalized_text_with_offsets``.
+    """
+    normalized_span, _ = _normalized_text_with_offsets(span)
+    if not normalized_span:
+        return []
+    occurrences: list[tuple[int, int]] = []
+    start = normalized_row.find(normalized_span)
+    while start >= 0:
+        occurrences.append((start, start + len(normalized_span)))
+        start = normalized_row.find(normalized_span, start + 1)
+    return occurrences
+
+
+def _check_reference_decomposition(
+    reference_spans: list[str], expected: str
+) -> tuple[list[str], list[str]]:
+    """Check that verbatim reference spans tile the whole reference answer.
+
+    Returns ``(overlapping_spans, uncovered_texts)``; both empty means the
+    spans form a complete, non-overlapping decomposition: every piece of the
+    reference is listed by exactly one item. Whitespace between pieces does
+    not break completeness. Anything else is a judge that trimmed the
+    denominator (omitted pieces) or listed the same text twice under
+    overlapping spans -- either way the recall score would be inflated, so
+    the caller fails the parse.
+    """
+    normalized_expected, offsets = _normalized_text_with_offsets(expected)
+    intervals: list[tuple[int, int, str]] = []
+    for span in reference_spans:
+        for start, end in _normalized_occurrences(span, normalized_expected):
+            intervals.append((start, end, span))
+    intervals.sort()
+
+    overlapping: set[str] = set()
+    active_end = -1
+    active_span = ""
+    for start, end, span in intervals:
+        # Same-span intervals are repeated occurrences of one item's piece,
+        # not ambiguity; distinct spans that intersect are (both intervals
+        # are sorted by start, so an active interval that reaches past the
+        # current start genuinely overlaps it).
+        if active_span and start < active_end and span != active_span:
+            overlapping.add(active_span)
+            overlapping.add(span)
+        if end > active_end:
+            active_end, active_span = end, span
+
+    uncovered: list[str] = []
+    covered_end = 0
+    for start, end, _ in intervals:
+        if start > covered_end:
+            gap = normalized_expected[covered_end:start]
+            if gap.strip():
+                uncovered.append(expected[offsets[covered_end] : offsets[start]])
+        covered_end = max(covered_end, end)
+    if covered_end < len(normalized_expected):
+        gap = normalized_expected[covered_end:]
+        if gap.strip():
+            uncovered.append(expected[offsets[covered_end] : offsets[-1]])
+    return sorted(overlapping), uncovered
+
+
 class RetrievalRelevanceScorer(LLMJudgeScorer):
     """Judge whether each retrieved context chunk is relevant to the user query.
 
@@ -858,6 +967,12 @@ class ContextPrecisionScorer(LLMJudgeScorer):
     score as ``needed / total`` from the validated verdicts. The judge's own
     overall score is advisory and recorded in ``details["judge_score"]``.
 
+    When two chunks carry the same information, "another chunk supplies it"
+    would otherwise apply symmetrically to both copies. The prompt fixes the
+    tie-break deterministically: the lowest-index chunk supplying the
+    information is the needed one, and every later chunk repeating it is not
+    needed, so identical chunks cannot both be marked needed.
+
     Verdicts that are not dicts, carry a non-integer ``chunk_index``, or an
     unrecognized label are discarded and reported in
     ``details["discarded_verdicts"]``. A duplicated or out-of-range
@@ -1082,17 +1197,26 @@ class ContextRecallScorer(LLMJudgeScorer):
 
     The judge decomposes the row's reference answer (``expected``) into
     individual pieces of information, each anchored to a verbatim span of the
-    reference, and marks each piece ``supported`` or ``not_supported`` with a
+    reference, and marks each piece with a boolean ``supported`` flag and a
     verbatim context span as evidence. The scorer validates those anchors:
 
     - A piece whose reference span is not verbatim in ``expected`` is discarded,
       so a judge cannot invent information the reference does not contain.
     - A piece whose ``supported`` flag is not a boolean is discarded.
-    - A ``supported`` piece whose context span is not verbatim in the rendered
-      chunk sequence the judge read is counted as not supported, because the
-      support claim cannot be verified.
+    - A ``supported`` piece is verified against the original chunk content,
+      not the XML-escaped envelope view the judge read: the quoted span is
+      unescaped and matched back to a retrieved chunk, and the span stored in
+      the result is the original chunk text. A span that only repeats the
+      envelope marker or the chunk's source label is not evidence, and a
+      support claim that cannot be verified this way is counted as not
+      supported rather than trusted.
     - A duplicated reference span fails the parse: the same information listed
       twice would otherwise double-count in the denominator.
+    - The surviving pieces must form a complete, non-overlapping decomposition
+      of the reference: overlapping spans, or reference text no piece covers,
+      fail the parse. A judge could otherwise shrink the denominator by
+      omitting the pieces the retrieval missed -- a two-fact reference where
+      only the supported fact is listed would score a perfect recall.
 
     The score is ``supported / valid pieces``, derived from the validated items.
     The judge's own overall score is advisory and recorded in
@@ -1243,9 +1367,16 @@ class ContextRecallScorer(LLMJudgeScorer):
                 if supported:
                     raw_context_span = item.get("context_span")
                     if isinstance(raw_context_span, str):
-                        context_span = (
-                            _verbatim_span(raw_context_span, parsed_context) or ""
-                        )
+                        # The judge quotes from the XML-escaped envelope view,
+                        # so the quote is unescaped and verified against the
+                        # original chunk content -- never against the rendered
+                        # prompt, where escaping artifacts and envelope syntax
+                        # would verify as false evidence. The stored span is
+                        # the original chunk text, not the escaped quote.
+                        unescaped_span = _xml_unescape_prompt_text(raw_context_span)
+                        context_span = _context_span_in_chunks(unescaped_span, chunks)
+                        if context_span and _is_envelope_or_label_only(context_span):
+                            context_span = ""
                     if not context_span:
                         # The judge claims support but cannot show it in the
                         # retrieved chunks. Downgrade rather than trust it.
@@ -1300,6 +1431,62 @@ class ContextRecallScorer(LLMJudgeScorer):
                     "judge_model": self.model,
                     "judge_response": _sanitize_judge_value(result),
                     "total_chunks": len(chunks),
+                    "discarded_items": discarded_items,
+                },
+                assessed=False,
+            )
+
+        # The denominator must come from a complete, non-overlapping
+        # decomposition of the reference. A judge that omits the pieces the
+        # retrieval missed would otherwise shrink the denominator and score a
+        # partial retrieval as perfect (a two-fact reference where only the
+        # supported fact is listed scores 1.0), and overlapping spans would
+        # count the same reference text as separate pieces. Either way the
+        # denominator is not trustworthy, so the row is un-assessed.
+        overlapping_spans, uncovered_texts = _check_reference_decomposition(
+            [item["reference_span"] for item in valid_items], expected
+        )
+        if overlapping_spans:
+            return ScorerResult(
+                score=0.0,
+                passed=False,
+                category=self.category,
+                explanation=(
+                    "Un-assessed: the judge's reference pieces overlap, so the "
+                    "same reference text would be counted more than once in "
+                    "the recall denominator. Inspect details.judge_response "
+                    "to see what the judge returned."
+                ),
+                details={
+                    "skipped": "judge_parse_failure",
+                    "scorer_name": self.name,
+                    "judge_model": self.model,
+                    "judge_response": _sanitize_judge_value(result),
+                    "total_chunks": len(chunks),
+                    "overlapping_reference_spans": overlapping_spans,
+                    "discarded_items": discarded_items,
+                },
+                assessed=False,
+            )
+        if uncovered_texts:
+            return ScorerResult(
+                score=0.0,
+                passed=False,
+                category=self.category,
+                explanation=(
+                    "Un-assessed: the judge's reference pieces do not cover "
+                    "the whole reference answer, so parts of it -- likely the "
+                    "pieces the retrieval missed -- are missing from the "
+                    "recall denominator. Inspect details.judge_response to "
+                    "see what the judge returned."
+                ),
+                details={
+                    "skipped": "judge_parse_failure",
+                    "scorer_name": self.name,
+                    "judge_model": self.model,
+                    "judge_response": _sanitize_judge_value(result),
+                    "total_chunks": len(chunks),
+                    "uncovered_reference_text": uncovered_texts,
                     "discarded_items": discarded_items,
                 },
                 assessed=False,

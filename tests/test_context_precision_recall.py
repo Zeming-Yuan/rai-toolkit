@@ -141,6 +141,35 @@ def test_precision_redundant_chunk_reduces_score() -> None:
     assert result.details["total_chunks"] == 3
 
 
+def test_precision_identical_chunks_earliest_is_needed() -> None:
+    # Two otherwise identical chunks: the prompt's ordering rule marks the
+    # lowest-index chunk needed and the later duplicate not needed, so the
+    # tie is broken deterministically instead of by judge preference.
+    scorer = _precision_scorer(
+        {
+            "score": 2,
+            "explanation": "One chunk duplicates the other exactly.",
+            "chunk_verdicts": [
+                {"chunk_index": 0, "needed": "needed", "reason": "Lowest index supplying the figure."},
+                {"chunk_index": 1, "needed": "not_needed", "reason": "Identical duplicate of chunk 0."},
+            ],
+        }
+    )
+
+    result = scorer.score(
+        "Revenue was $10M.",
+        input="What was the revenue?",
+        context="Revenue was $10M --- Revenue was $10M",
+    )
+
+    assert result.assessed
+    assert result.score == 0.5
+    assert result.details["needed_chunks"] == 1
+    assert result.details["total_chunks"] == 2
+    assert result.details["chunk_verdicts"][0]["needed"] == "needed"
+    assert result.details["chunk_verdicts"][1]["needed"] == "not_needed"
+
+
 def test_precision_no_chunks_needed_scores_zero() -> None:
     scorer = _precision_scorer(
         {
@@ -811,10 +840,10 @@ def test_recall_unverifiable_context_span_downgrades_to_not_supported() -> None:
     assert result.details["reference_items"][0]["supported"] is False
 
 
-def test_recall_context_span_is_checked_against_the_rendered_chunks() -> None:
-    # The judge reads the XML-escaped chunk envelopes, so a chunk containing
-    # "&" is shown as "&amp;". A context span quoted from that view verifies;
-    # the raw form is not what the judge was shown and does not.
+def test_recall_context_span_is_checked_against_original_chunk_content() -> None:
+    # Evidence is verified against the chunk's original text, not the escaped
+    # envelope view the judge read: a natural quote containing "&" verifies,
+    # and the span stored in the result is the original chunk text.
     scorer = _recall_scorer(
         {
             "score": 3,
@@ -822,8 +851,8 @@ def test_recall_context_span_is_checked_against_the_rendered_chunks() -> None:
                 {
                     "reference_span": "R&D spending was $2M.",
                     "supported": True,
-                    "context_span": "R&amp;D spending was $2M",
-                    "reason": "Quoted from the envelope.",
+                    "context_span": "R&D spending was $2M",
+                    "reason": "Quoted from the chunk text.",
                 },
             ],
         }
@@ -838,7 +867,104 @@ def test_recall_context_span_is_checked_against_the_rendered_chunks() -> None:
 
     assert result.assessed
     assert result.score == 1.0
-    assert result.details["reference_items"][0]["context_span"] == "R&amp;D spending was $2M"
+    stored = result.details["reference_items"][0]["context_span"]
+    assert stored == "R&D spending was $2M"
+    assert "&amp;" not in stored
+
+
+def test_recall_escaped_prompt_quote_maps_back_to_original_text() -> None:
+    # The judge reads XML-escaped chunk content, so its quote can arrive in
+    # escaped form. The quote is unescaped and matched against the original
+    # chunk text, and the original text -- not the escaped quote -- is stored.
+    scorer = _recall_scorer(
+        {
+            "score": 3,
+            "reference_items": [
+                {
+                    "reference_span": "R&D spending was $2M.",
+                    "supported": True,
+                    "context_span": "R&amp;D spending was $2M",
+                    "reason": "Quoted from the escaped envelope.",
+                },
+            ],
+        }
+    )
+
+    result = scorer.score(
+        "R&D spending was $2M.",
+        input="What was R&D spending?",
+        context="[doc-1] R&D spending was $2M",
+        expected="R&D spending was $2M.",
+    )
+
+    assert result.assessed
+    assert result.score == 1.0
+    assert result.details["unverified_support_items"] == 0
+    stored = result.details["reference_items"][0]["context_span"]
+    assert stored == "R&D spending was $2M"
+    assert "&amp;" not in stored
+
+
+def test_recall_envelope_only_span_is_not_evidence() -> None:
+    # A quoted span that only repeats the envelope marker verifies nothing:
+    # the envelope is prompt scaffolding, not retrieved information.
+    scorer = _recall_scorer(
+        {
+            "score": 3,
+            "reference_items": [
+                {
+                    "reference_span": "Growth was 12%.",
+                    "supported": True,
+                    "context_span": '<chunk index="0">',
+                    "reason": "Quoted the envelope instead of the chunk.",
+                },
+            ],
+        }
+    )
+
+    result = scorer.score(
+        "Growth was 12%.",
+        input="What was the growth?",
+        context="[doc-1] Growth was 12%.",
+        expected="Growth was 12%.",
+    )
+
+    assert result.assessed
+    assert result.score == 0.0
+    assert result.details["unverified_support_items"] == 1
+    assert result.details["reference_items"][0]["supported"] is False
+    assert result.details["reference_items"][0]["context_span"] == ""
+
+
+def test_recall_source_label_only_span_is_not_evidence() -> None:
+    # The chunk's [source-id] label is part of the chunk text, so a label-only
+    # quote does verify verbatim -- but it is scaffolding, not evidence, so
+    # the support claim is still downgraded.
+    scorer = _recall_scorer(
+        {
+            "score": 3,
+            "reference_items": [
+                {
+                    "reference_span": "Growth was 12%.",
+                    "supported": True,
+                    "context_span": "[doc-1]",
+                    "reason": "Quoted the source label only.",
+                },
+            ],
+        }
+    )
+
+    result = scorer.score(
+        "Growth was 12%.",
+        input="What was the growth?",
+        context="[doc-1] Growth was 12%.",
+        expected="Growth was 12%.",
+    )
+
+    assert result.assessed
+    assert result.score == 0.0
+    assert result.details["unverified_support_items"] == 1
+    assert result.details["reference_items"][0]["supported"] is False
 
 
 def test_recall_duplicate_reference_span_is_a_parse_failure() -> None:
@@ -876,31 +1002,132 @@ def test_recall_duplicate_reference_span_is_a_parse_failure() -> None:
     assert result.details["duplicate_reference_spans"] == ["Growth was 12%."]
 
 
-def test_recall_non_boolean_supported_flag_is_discarded() -> None:
+def test_recall_omitted_fact_is_a_parse_failure() -> None:
+    # The recall denominator must come from a complete decomposition of the
+    # reference. A judge that lists only the supported fact of a two-fact
+    # reference would otherwise score a partial retrieval as perfect.
     scorer = _recall_scorer(
         {
             "score": 3,
+            "explanation": "Everything was retrieved.",
             "reference_items": [
                 {
-                    "reference_span": "Growth was 12%.",
-                    "supported": "yes",
-                    "context_span": "Growth was 12%.",
-                    "reason": "String flag.",
+                    "reference_span": "Revenue was $10 million.",
+                    "supported": True,
+                    "context_span": "Revenue was $10 million.",
+                    "reason": "Stated verbatim.",
                 },
             ],
         }
     )
 
     result = scorer.score(
-        "Growth was 12%.",
-        input="What was the growth?",
-        context="[doc-1] Growth was 12%.",
-        expected="Growth was 12%.",
+        "Revenue was $10 million.",
+        input="What was the revenue and growth?",
+        context="[doc-1] Revenue was $10 million.",
+        expected="Revenue was $10 million. Growth was 12%.",
     )
 
     assert not result.assessed
     assert result.details["skipped"] == "judge_parse_failure"
-    assert result.details["discarded_items"] == 1
+    assert result.details["uncovered_reference_text"] == [" Growth was 12%."]
+    assert "judge_response" in result.details
+
+
+def test_recall_overlapping_reference_spans_are_a_parse_failure() -> None:
+    # Overlapping or nested spans would count the same reference text as
+    # separate pieces in the denominator, so the decomposition is ambiguous
+    # and the row is un-assessed.
+    scorer = _recall_scorer(
+        {
+            "score": 3,
+            "reference_items": [
+                {
+                    "reference_span": "Revenue was $10 million.",
+                    "supported": True,
+                    "context_span": "Revenue was $10 million.",
+                    "reason": "Stated verbatim.",
+                },
+                {
+                    "reference_span": "was $10 million",
+                    "supported": False,
+                    "context_span": "",
+                    "reason": "Nested in the first piece.",
+                },
+            ],
+        }
+    )
+
+    result = scorer.score(
+        "Revenue was $10 million.",
+        input="What was the revenue?",
+        context="[doc-1] Revenue was $10 million.",
+        expected="Revenue was $10 million.",
+    )
+
+    assert not result.assessed
+    assert result.details["skipped"] == "judge_parse_failure"
+    assert "overlapping_reference_spans" in result.details
+
+
+def test_recall_non_boolean_supported_flag_is_discarded() -> None:
+    # Only JSON Booleans are accepted. String labels ("supported",
+    # "not_supported"), numeric stand-ins, and nulls are discarded -- a string
+    # label from a misread prompt must never count as a verdict.
+    for bad_flag in ("supported", "not_supported", "yes", 1, None):
+        scorer = _recall_scorer(
+            {
+                "score": 3,
+                "reference_items": [
+                    {
+                        "reference_span": "Growth was 12%.",
+                        "supported": bad_flag,
+                        "context_span": "Growth was 12%.",
+                        "reason": "Non-boolean flag.",
+                    },
+                ],
+            }
+        )
+
+        result = scorer.score(
+            "Growth was 12%.",
+            input="What was the growth?",
+            context="[doc-1] Growth was 12%.",
+            expected="Growth was 12%.",
+        )
+
+        assert not result.assessed, bad_flag
+        assert result.details["skipped"] == "judge_parse_failure", bad_flag
+        assert result.details["discarded_items"] == 1, bad_flag
+
+
+def test_recall_boolean_flags_are_accepted() -> None:
+    # Both Boolean values are valid verdicts: true counts as supported when
+    # the context span verifies, false counts as not supported outright.
+    for flag, expected_score in ((True, 1.0), (False, 0.0)):
+        scorer = _recall_scorer(
+            {
+                "score": 3,
+                "reference_items": [
+                    {
+                        "reference_span": "Growth was 12%.",
+                        "supported": flag,
+                        "context_span": "Growth was 12%." if flag else "",
+                        "reason": "Boolean flag.",
+                    },
+                ],
+            }
+        )
+
+        result = scorer.score(
+            "Growth was 12%.",
+            input="What was the growth?",
+            context="[doc-1] Growth was 12%.",
+            expected="Growth was 12%.",
+        )
+
+        assert result.assessed, flag
+        assert result.score == expected_score, flag
 
 
 def test_recall_non_dict_items_are_discarded() -> None:
@@ -1017,3 +1244,24 @@ def test_recall_template_json_example_is_parseable() -> None:
     assert payload["reference_items"][0]["reference_span"] == "ref"
     assert payload["reference_items"][0]["supported"] is True
     assert payload["reference_items"][0]["context_span"] == "ctx"
+
+
+def test_recall_template_requires_boolean_supported_field() -> None:
+    # The prose and the JSON schema must agree: "supported" is a JSON Boolean,
+    # so the old string labels must not appear as verdict values anywhere in
+    # the prompt (the JSON example's "supported" key is the field name, not a
+    # label).
+    recall = JUDGE_PROMPTS["ContextRecallScorer"]
+    for text in recall.values():
+        assert '"not_supported"' not in text
+        assert '- "supported"' not in text
+    assert "Boolean" in recall["template"]
+
+
+def test_precision_template_defines_duplicate_chunk_ordering() -> None:
+    # "Another chunk supplies the same information" applies symmetrically to
+    # identical chunks, so the prompt must fix the tie-break: the
+    # lowest-index chunk is needed, later duplicates are not.
+    precision = JUDGE_PROMPTS["ContextPrecisionScorer"]
+    for text in precision.values():
+        assert "lowest chunk_index" in text or "lowest chunk index" in text

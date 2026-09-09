@@ -142,7 +142,9 @@ CONTEXT_PRECISION_SCORER_SYSTEM = (
     "a whole: a chunk that repeats information another retrieved chunk already "
     "supplies is not needed, even though it is on topic. Precision measures how "
     "much of the retrieved set was necessary, so redundant or off-topic chunks "
-    "count against it."
+    "count against it. When two chunks contain the same information, exactly one "
+    "of them is needed: the one with the lowest chunk index. Every later chunk "
+    "repeating that information is not needed."
 )
 
 CONTEXT_PRECISION_SCORER_TEMPLATE = """Decide whether each retrieved context chunk was needed to answer the user query.
@@ -158,7 +160,11 @@ Assign each chunk a label:
 
 Judge the retrieved set as a whole. A chunk that is on topic but repeats another
 chunk's information is "not_needed": precision asks how much of the retrieved set
-was necessary, not how much of it was on topic.
+was necessary, not how much of it was on topic. Apply one fixed rule when chunks
+repeat each other: if two chunks contain the same information, the chunk with the
+lowest chunk_index is the one that supplies it and is "needed"; every later chunk
+repeating that information is "not_needed", even when the chunks are otherwise
+identical.
 
 Score overall precision on a 0-3 scale:
 - 3: Every retrieved chunk was needed.
@@ -181,7 +187,9 @@ CONTEXT_RECALL_SCORER_SYSTEM = (
     "break a reference answer into the individual pieces of information it "
     "contains, then decide whether the retrieved context supplies each piece. "
     "Work only from the reference answer: every piece you list must be copied "
-    "verbatim from it, never paraphrased and never invented. A piece counts as "
+    "verbatim from it, never paraphrased and never invented. Decompose the "
+    "reference completely: the pieces must together cover the whole reference "
+    "answer, omit no part of it, and not overlap each other. A piece counts as "
     "supplied only when the retrieved context states it; topically related or "
     "partially matching content does not count."
 )
@@ -197,15 +205,21 @@ CONTEXT_RECALL_SCORER_TEMPLATE = """Decide how much of the reference answer the 
 Break the Reference Answer into its individual pieces of information: separate
 facts, figures, conditions, and recommendations. List each piece with an exact
 verbatim span copied from the Reference Answer. Do not paraphrase and do not add
-pieces the Reference Answer does not state.
+pieces the Reference Answer does not state. The pieces must together form a
+complete decomposition of the Reference Answer: every part of it belongs to
+exactly one piece, no part may be omitted, and no two pieces may overlap.
 
-For each piece, decide whether the Retrieved Context supplies it:
-- "supported": the retrieved context states this piece of information.
-- "not_supported": the retrieved context does not state it, or states only a
-  related but different fact.
+For each piece, decide whether the Retrieved Context supplies it, and record the
+verdict as a JSON Boolean in the "supported" field:
+- true: the retrieved context states this piece of information.
+- false: the retrieved context does not state it, or states only a related but
+  different fact.
+Use only the Boolean values true and false; never a quoted string label.
 
 For each supported piece, give an exact verbatim span copied from the Retrieved
-Context that states it. Spans must be copied exactly; do not paraphrase.
+Context that states it. Spans must be copied exactly; do not paraphrase. Quote
+the chunk's text itself, never the <chunk ...> envelope marker or the chunk's
+[source-id] label.
 
 Score overall recall on a 0-3 scale:
 - 3: Every piece of information in the reference answer is supplied by the retrieved context.

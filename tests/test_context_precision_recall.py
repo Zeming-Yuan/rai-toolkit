@@ -170,6 +170,46 @@ def test_precision_identical_chunks_earliest_is_needed() -> None:
     assert result.details["chunk_verdicts"][1]["needed"] == "not_needed"
 
 
+def test_precision_identical_chunks_both_needed_are_demoted() -> None:
+    # The prompt's lowest-index rule is enforced by the scorer itself: a judge
+    # marking both copies of an exact duplicate needed is corrected, not
+    # rewarded with perfect precision. The --- delimiter leaves whitespace
+    # padding on each chunk, so grouping must see through it.
+    scorer = _precision_scorer(
+        {
+            "score": 3,
+            "explanation": "Both chunks supply the figure.",
+            "chunk_verdicts": [
+                {"chunk_index": 0, "needed": "needed", "reason": "States the figure."},
+                {"chunk_index": 1, "needed": "needed", "reason": "Also states the figure."},
+            ],
+        }
+    )
+
+    scorer.threshold = 0.7
+    result = scorer.score(
+        "Revenue was $10M.",
+        input="What was the revenue?",
+        context="Revenue was $10M --- Revenue was $10M",
+    )
+
+    assert result.assessed
+    assert result.score == 0.5
+    assert result.details["needed_chunks"] == 1
+    assert result.details["chunk_verdicts"][0]["needed"] == "needed"
+    assert result.details["chunk_verdicts"][1]["needed"] == "not_needed"
+    assert result.details["duplicate_chunk_corrections"] == [
+        {
+            "chunk_index": 1,
+            "duplicate_of": 0,
+            "reason": (
+                "Exact duplicate of chunk 0; the lowest-index chunk "
+                "supplies the information."
+            ),
+        }
+    ]
+
+
 def test_precision_no_chunks_needed_scores_zero() -> None:
     scorer = _precision_scorer(
         {
@@ -595,8 +635,9 @@ def test_recall_all_items_supported_scores_one() -> None:
     assert result.assessed
     assert result.score == 1.0
     assert result.passed
-    assert result.details["supported_items"] == 2
-    assert result.details["total_items"] == 2
+    # Adjacent supported pieces merge into one supplied region.
+    assert result.details["supported_regions"] == 1
+    assert result.details["total_regions"] == 1
 
 
 def test_recall_missing_item_reduces_score() -> None:
@@ -627,6 +668,7 @@ def test_recall_missing_item_reduces_score() -> None:
         }
     )
 
+    scorer.threshold = 0.7
     result = scorer.score(
         "Revenue was $10 million.",
         input="Summarize the quarter.",
@@ -635,10 +677,90 @@ def test_recall_missing_item_reduces_score() -> None:
     )
 
     assert result.assessed
-    assert result.score == 1 / 3
+    assert result.score == 1 / 2
     assert not result.passed
-    assert result.details["supported_items"] == 1
-    assert result.details["total_items"] == 3
+    # The two unsupported sentences are adjacent, so they merge into one
+    # unsupplied region: the judge could equally have listed them as a single
+    # piece, and the score must not depend on that choice.
+    assert result.details["supported_regions"] == 1
+    assert result.details["total_regions"] == 2
+
+
+def test_recall_score_is_invariant_to_equivalent_splits() -> None:
+    # Two replies that decompose the same reference differently but make the
+    # same supported / not-supported claim over it must score identically.
+    reference = "Alpha beta gamma. Delta epsilon."
+    context = "[doc-1] Alpha beta gamma."
+
+    sentence_level = _recall_scorer(
+        {
+            "score": 2,
+            "explanation": "First sentence retrieved.",
+            "reference_items": [
+                {
+                    "reference_span": "Alpha beta gamma.",
+                    "supported": True,
+                    "context_span": "Alpha beta gamma.",
+                    "reason": "Supplied verbatim.",
+                },
+                {
+                    "reference_span": "Delta epsilon.",
+                    "supported": False,
+                    "context_span": "",
+                    "reason": "Not in the retrieved chunks.",
+                },
+            ],
+        }
+    ).score(
+        "Alpha beta gamma.",
+        input="What are the values?",
+        context=context,
+        expected=reference,
+    )
+
+    word_level = _recall_scorer(
+        {
+            "score": 2,
+            "explanation": "First sentence retrieved.",
+            "reference_items": [
+                {
+                    "reference_span": "Alpha",
+                    "supported": True,
+                    "context_span": "Alpha",
+                    "reason": "Supplied verbatim.",
+                },
+                {
+                    "reference_span": "beta",
+                    "supported": True,
+                    "context_span": "beta",
+                    "reason": "Supplied verbatim.",
+                },
+                {
+                    "reference_span": "gamma.",
+                    "supported": True,
+                    "context_span": "gamma.",
+                    "reason": "Supplied verbatim.",
+                },
+                {
+                    "reference_span": "Delta epsilon.",
+                    "supported": False,
+                    "context_span": "",
+                    "reason": "Not in the retrieved chunks.",
+                },
+            ],
+        }
+    ).score(
+        "Alpha beta gamma.",
+        input="What are the values?",
+        context=context,
+        expected=reference,
+    )
+
+    assert sentence_level.assessed
+    assert word_level.assessed
+    assert sentence_level.score == word_level.score == 0.5
+    assert sentence_level.details["total_regions"] == 2
+    assert word_level.details["total_regions"] == 2
 
 
 def test_recall_no_items_supported_scores_zero() -> None:
@@ -762,7 +884,7 @@ def test_recall_fabricated_reference_span_is_discarded() -> None:
 
     assert result.assessed
     assert result.details["discarded_items"] == 1
-    assert result.details["total_items"] == 1
+    assert result.details["total_regions"] == 1
     assert result.score == 1.0
 
 
@@ -836,7 +958,7 @@ def test_recall_unverifiable_context_span_downgrades_to_not_supported() -> None:
     assert result.assessed
     assert result.score == 0.0
     assert result.details["unverified_support_items"] == 1
-    assert result.details["supported_items"] == 0
+    assert result.details["supported_regions"] == 0
     assert result.details["reference_items"][0]["supported"] is False
 
 
@@ -967,6 +1089,40 @@ def test_recall_source_label_only_span_is_not_evidence() -> None:
     assert result.details["reference_items"][0]["supported"] is False
 
 
+def test_recall_bracketed_content_is_not_treated_as_scaffolding() -> None:
+    # Bracketed text that is not the chunk's source label is chunk content: a
+    # quote of "[FDA]" is real evidence, not an envelope artifact. The
+    # scaffolding check only strips envelope markers and the matched chunk's
+    # own leading label.
+    scorer = _recall_scorer(
+        {
+            "score": 3,
+            "explanation": "The agency was named.",
+            "reference_items": [
+                {
+                    "reference_span": "The [FDA] approved the drug.",
+                    "supported": True,
+                    "context_span": "[FDA]",
+                    "reason": "Names the agency verbatim.",
+                },
+            ],
+        }
+    )
+
+    result = scorer.score(
+        "The [FDA] approved the drug.",
+        input="Which agency approved the drug?",
+        context="[doc-1] The [FDA] approved the drug.",
+        expected="The [FDA] approved the drug.",
+    )
+
+    assert result.assessed
+    assert result.score == 1.0
+    assert result.details["unverified_support_items"] == 0
+    assert result.details["reference_items"][0]["supported"] is True
+    assert result.details["reference_items"][0]["context_span"] == "[FDA]"
+
+
 def test_recall_duplicate_reference_span_is_a_parse_failure() -> None:
     # The same piece listed twice would double-count in the denominator, so
     # the item set is ambiguous and the row is un-assessed.
@@ -1000,6 +1156,74 @@ def test_recall_duplicate_reference_span_is_a_parse_failure() -> None:
     assert not result.assessed
     assert result.details["skipped"] == "judge_parse_failure"
     assert result.details["duplicate_reference_spans"] == ["Growth was 12%."]
+
+
+def test_recall_repeated_sentence_one_item_cannot_cover_both() -> None:
+    # A reference that repeats a sentence holds that piece of information
+    # twice: each item is bound to one occurrence, so listing the sentence
+    # once leaves the second occurrence uncovered and the row is un-assessed.
+    scorer = _recall_scorer(
+        {
+            "score": 3,
+            "explanation": "Both copies were retrieved.",
+            "reference_items": [
+                {
+                    "reference_span": "Apply twice.",
+                    "supported": True,
+                    "context_span": "Apply twice.",
+                    "reason": "Only listing.",
+                },
+            ],
+        }
+    )
+
+    result = scorer.score(
+        "Apply twice. Apply twice.",
+        input="How do I apply it?",
+        context="[doc-1] Apply twice. Apply twice.",
+        expected="Apply twice. Apply twice.",
+    )
+
+    assert not result.assessed
+    assert result.details["skipped"] == "judge_parse_failure"
+    assert result.details["uncovered_reference_text"]
+
+
+def test_recall_repeated_sentence_scored_per_occurrence() -> None:
+    # Listing the repeated sentence once per occurrence is the honest
+    # decomposition: one supplied copy and one missing copy score 0.5.
+    scorer = _recall_scorer(
+        {
+            "score": 2,
+            "explanation": "One copy retrieved.",
+            "reference_items": [
+                {
+                    "reference_span": "Apply twice.",
+                    "supported": True,
+                    "context_span": "Apply twice.",
+                    "reason": "First copy.",
+                },
+                {
+                    "reference_span": "Apply twice.",
+                    "supported": False,
+                    "context_span": "",
+                    "reason": "Second copy missing from context.",
+                },
+            ],
+        }
+    )
+
+    result = scorer.score(
+        "Apply twice. Apply twice.",
+        input="How do I apply it?",
+        context="[doc-1] Apply twice.",
+        expected="Apply twice. Apply twice.",
+    )
+
+    assert result.assessed
+    assert result.score == 0.5
+    assert result.details["supported_regions"] == 1
+    assert result.details["total_regions"] == 2
 
 
 def test_recall_omitted_fact_is_a_parse_failure() -> None:
@@ -1156,7 +1380,7 @@ def test_recall_non_dict_items_are_discarded() -> None:
 
     assert result.assessed
     assert result.details["discarded_items"] == 2
-    assert result.details["total_items"] == 1
+    assert result.details["total_regions"] == 1
 
 
 def test_recall_non_object_json_reply_is_controlled_unassessed() -> None:

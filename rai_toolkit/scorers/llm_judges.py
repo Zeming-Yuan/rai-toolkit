@@ -532,34 +532,41 @@ def _xml_unescape_prompt_text(text: str) -> str:
     return text.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
 
 
-_ENVELOPE_OR_LABEL_PATTERN = re.compile(r"\[[^\[\]]*\]|</?chunk\b[^>]*>")
+_ENVELOPE_MARKER_PATTERN = re.compile(r"</?chunk\b[^>]*>")
 
 
-def _is_envelope_or_label_only(span: str) -> bool:
+def _is_envelope_or_label_only(span: str, chunk: str) -> bool:
     """Return True when a quoted span carries no chunk content, only syntax.
 
-    A ``<chunk index="N">`` envelope marker or a ``[source-id]`` label is part
-    of the prompt scaffolding (or, for a label, the chunk's first token), not
-    evidence that the retrieval supplied a piece of information. A span made
-    up solely of such markers -- or of whitespace around them -- verifies
-    nothing, even when the text is genuinely present in a chunk.
+    A ``<chunk index="N">`` envelope marker is prompt scaffolding, and the
+    matched chunk's own leading ``[source-id]`` label names the source rather
+    than stating anything, so a span made up solely of such markers -- or of
+    whitespace around them -- verifies nothing. Bracketed text that is not
+    that label (``[FDA]`` in the chunk body) is chunk content and survives
+    this check.
     """
-    return not _ENVELOPE_OR_LABEL_PATTERN.sub("", span).strip()
+    residue = _ENVELOPE_MARKER_PATTERN.sub("", span)
+    label_match = _SOURCE_LABEL_PATTERN.match(chunk)
+    if label_match:
+        residue = residue.replace(label_match.group(0), "")
+    return not residue.strip()
 
 
-def _context_span_in_chunks(span: str, chunks: list[str]) -> str:
+def _context_span_in_chunks(span: str, chunks: list[str]) -> tuple[str, str]:
     """Verify a quoted span against the original chunk content, not the prompt.
 
-    Returns the span verbatim as it appears in the matching original chunk, or
-    "" when no chunk contains it. Matching against a single original chunk
-    (rather than the rendered envelope sequence) keeps evidence anchored to
-    what was actually retrieved and cannot be satisfied by envelope syntax.
+    Returns ``(verified_span, matched_chunk)`` -- the span verbatim as it
+    appears in the matching original chunk, and that chunk so the caller can
+    tell scaffolding from the chunk's own label -- or ``("", "")`` when no
+    chunk contains it. Matching against a single original chunk (rather than
+    the rendered envelope sequence) keeps evidence anchored to what was
+    actually retrieved and cannot be satisfied by envelope syntax.
     """
     for chunk in chunks:
         verified = _verbatim_span(span, chunk)
         if verified:
-            return verified
-    return ""
+            return verified, chunk
+    return "", ""
 
 
 def _normalized_occurrences(span: str, normalized_row: str) -> list[tuple[int, int]]:
@@ -580,34 +587,37 @@ def _normalized_occurrences(span: str, normalized_row: str) -> list[tuple[int, i
 
 
 def _check_reference_decomposition(
-    reference_spans: list[str], expected: str
+    bound_pieces: list[tuple[str, int, int]], expected: str
 ) -> tuple[list[str], list[str]]:
-    """Check that verbatim reference spans tile the whole reference answer.
+    """Check that bound reference pieces tile the whole reference answer.
+
+    Each piece arrives as ``(span, start, end)`` with its interval already
+    bound to one occurrence of the span in the normalized reference text (see
+    the recall scorer), so this function never re-derives occurrences: one
+    item covers exactly the occurrence it was bound to, never every repeated
+    occurrence at once.
 
     Returns ``(overlapping_spans, uncovered_texts)``; both empty means the
-    spans form a complete, non-overlapping decomposition: every piece of the
-    reference is listed by exactly one item. Whitespace between pieces does
-    not break completeness. Anything else is a judge that trimmed the
+    pieces form a complete, non-overlapping decomposition: every part of the
+    reference is covered by exactly one bound piece. Whitespace between pieces
+    does not break completeness. Anything else is a judge that trimmed the
     denominator (omitted pieces) or listed the same text twice under
     overlapping spans -- either way the recall score would be inflated, so
     the caller fails the parse.
     """
     normalized_expected, offsets = _normalized_text_with_offsets(expected)
-    intervals: list[tuple[int, int, str]] = []
-    for span in reference_spans:
-        for start, end in _normalized_occurrences(span, normalized_expected):
-            intervals.append((start, end, span))
+    intervals: list[tuple[int, int, str]] = [
+        (start, end, span) for span, start, end in bound_pieces
+    ]
     intervals.sort()
 
     overlapping: set[str] = set()
     active_end = -1
     active_span = ""
     for start, end, span in intervals:
-        # Same-span intervals are repeated occurrences of one item's piece,
-        # not ambiguity; distinct spans that intersect are (both intervals
-        # are sorted by start, so an active interval that reaches past the
-        # current start genuinely overlaps it).
-        if active_span and start < active_end and span != active_span:
+        # Intervals are sorted by start, so an active interval that reaches
+        # past the current start genuinely overlaps it.
+        if active_span and start < active_end:
             overlapping.add(active_span)
             overlapping.add(span)
         if end > active_end:
@@ -971,7 +981,11 @@ class ContextPrecisionScorer(LLMJudgeScorer):
     would otherwise apply symmetrically to both copies. The prompt fixes the
     tie-break deterministically: the lowest-index chunk supplying the
     information is the needed one, and every later chunk repeating it is not
-    needed, so identical chunks cannot both be marked needed.
+    needed, so identical chunks cannot both be marked needed. Exact
+    duplicates are mechanically decidable, so the scorer enforces that rule
+    itself: a later exact duplicate of an earlier chunk is demoted to
+    ``not_needed`` even when the judge marked it needed, and every demotion
+    is recorded in ``details["duplicate_chunk_corrections"]``.
 
     Verdicts that are not dicts, carry a non-integer ``chunk_index``, or an
     unrecognized label are discarded and reported in
@@ -1148,14 +1162,45 @@ class ContextPrecisionScorer(LLMJudgeScorer):
                 assessed=False,
             )
 
-        needed_count = sum(
-            1 for v in valid_verdicts.values() if v.get("needed") == "needed"
-        )
+        # Exact duplicates are mechanically decidable, so the prompt's
+        # lowest-index rule is enforced here rather than trusted to the judge:
+        # within a group of chunks with identical content only the lowest
+        # index can be needed, and a later copy marked needed is demoted and
+        # recorded. Without this, a judge marking both copies of a duplicated
+        # chunk needed would score perfect precision. Chunks are grouped by
+        # whitespace-collapsed content, so delimiter padding around a ``---``
+        # fallback chunk does not hide the duplication.
+        content_groups: dict[str, list[int]] = {}
+        for index in range(len(chunks)):
+            normalized_chunk = _normalized_text_with_offsets(chunks[index])[0].strip()
+            content_groups.setdefault(normalized_chunk, []).append(index)
+        needed_by_index: dict[int, str] = {
+            index: str(valid_verdicts[index].get("needed"))
+            for index in valid_verdicts
+        }
+        duplicate_chunk_corrections: list[dict[str, Any]] = []
+        for indexes in content_groups.values():
+            for index in indexes[1:]:
+                if needed_by_index[index] == "needed":
+                    needed_by_index[index] = "not_needed"
+                    duplicate_chunk_corrections.append(
+                        {
+                            "chunk_index": index,
+                            "duplicate_of": indexes[0],
+                            "reason": (
+                                "Exact duplicate of chunk "
+                                f"{indexes[0]}; the lowest-index chunk "
+                                "supplies the information."
+                            ),
+                        }
+                    )
+
+        needed_count = sum(1 for label in needed_by_index.values() if label == "needed")
         precision = needed_count / len(chunks)
         chunk_verdicts = [
             {
                 "chunk_index": index,
-                "needed": valid_verdicts[index].get("needed"),
+                "needed": needed_by_index[index],
                 "reason": str(valid_verdicts[index].get("reason", "")),
             }
             for index in sorted(valid_verdicts)
@@ -1178,6 +1223,7 @@ class ContextPrecisionScorer(LLMJudgeScorer):
                 "chunk_verdicts": chunk_verdicts,
                 "needed_chunks": needed_count,
                 "total_chunks": len(chunks),
+                "duplicate_chunk_corrections": duplicate_chunk_corrections,
                 "discarded_verdicts": discarded_verdicts,
                 "judge_score": judge_score,
                 "judge_explanation": str(result.get("explanation", "")),
@@ -1210,18 +1256,26 @@ class ContextRecallScorer(LLMJudgeScorer):
       envelope marker or the chunk's source label is not evidence, and a
       support claim that cannot be verified this way is counted as not
       supported rather than trusted.
-    - A duplicated reference span fails the parse: the same information listed
-      twice would otherwise double-count in the denominator.
+    - Each piece is bound to exactly one occurrence of its reference span: the
+      earliest occurrence no earlier piece has claimed. A span the reference
+      repeats must be listed once per occurrence -- one piece can never cover
+      every repeated occurrence -- and a listing with no unclaimed occurrence
+      left fails the parse, since the same information listed twice would
+      double-count in the denominator.
     - The surviving pieces must form a complete, non-overlapping decomposition
       of the reference: overlapping spans, or reference text no piece covers,
       fail the parse. A judge could otherwise shrink the denominator by
       omitting the pieces the retrieval missed -- a two-fact reference where
       only the supported fact is listed would score a perfect recall.
 
-    The score is ``supported / valid pieces``, derived from the validated items.
-    The judge's own overall score is advisory and recorded in
-    ``details["judge_score"]``. A reply that yields no valid piece is a parse
-    failure rather than a perfect or empty score.
+    The score is ``supported regions / regions``, derived from the validated
+    pieces: adjacent pieces sharing a verdict are merged into maximal stretches
+    of the reference first, so the score depends on which parts of the
+    reference are supplied, not on how the judge happened to partition it --
+    two replies that make the same supported / not-supported claim over the
+    reference score identically. The judge's own overall score is advisory and
+    recorded in ``details["judge_score"]``. A reply that yields no valid piece
+    is a parse failure rather than a perfect or empty score.
 
     Rows without retrieved context, with a blank query, or without a reference
     answer return ``assessed=False`` (``skipped`` is ``empty_context`` /
@@ -1336,10 +1390,12 @@ class ContextRecallScorer(LLMJudgeScorer):
         judge_score = _advisory_judge_score(result.get("score"))
 
         valid_items: list[dict[str, Any]] = []
-        seen_spans: set[str] = set()
+        item_intervals: list[tuple[int, int]] = []
+        bound_occurrences: set[tuple[int, int]] = set()
         duplicate_spans: list[str] = []
         discarded_items = 0
         unverified_support_items = 0
+        normalized_expected, _expected_offsets = _normalized_text_with_offsets(expected)
         raw_items = result.get("reference_items")
         if isinstance(raw_items, list):
             for item in raw_items:
@@ -1354,11 +1410,26 @@ class ContextRecallScorer(LLMJudgeScorer):
                 if not reference_span:
                     discarded_items += 1
                     continue
-                if reference_span in seen_spans:
+                # Each item is bound to exactly one occurrence of its span in
+                # the reference: the earliest occurrence no earlier item has
+                # claimed. A span the reference repeats must be listed once
+                # per occurrence -- one item can never cover every repeated
+                # occurrence, and a listing with no unclaimed occurrence left
+                # is a duplicate.
+                interval = next(
+                    (
+                        occurrence
+                        for occurrence in _normalized_occurrences(
+                            reference_span, normalized_expected
+                        )
+                        if occurrence not in bound_occurrences
+                    ),
+                    None,
+                )
+                if interval is None:
                     duplicate_spans.append(reference_span)
                     discarded_items += 1
                     continue
-                seen_spans.add(reference_span)
                 supported = item.get("supported")
                 if not isinstance(supported, bool):
                     discarded_items += 1
@@ -1374,8 +1445,12 @@ class ContextRecallScorer(LLMJudgeScorer):
                         # would verify as false evidence. The stored span is
                         # the original chunk text, not the escaped quote.
                         unescaped_span = _xml_unescape_prompt_text(raw_context_span)
-                        context_span = _context_span_in_chunks(unescaped_span, chunks)
-                        if context_span and _is_envelope_or_label_only(context_span):
+                        context_span, matched_chunk = _context_span_in_chunks(
+                            unescaped_span, chunks
+                        )
+                        if context_span and _is_envelope_or_label_only(
+                            context_span, matched_chunk
+                        ):
                             context_span = ""
                     if not context_span:
                         # The judge claims support but cannot show it in the
@@ -1390,6 +1465,8 @@ class ContextRecallScorer(LLMJudgeScorer):
                         "reason": str(item.get("reason", "")),
                     }
                 )
+                item_intervals.append(interval)
+                bound_occurrences.add(interval)
 
         if duplicate_spans:
             return ScorerResult(
@@ -1397,10 +1474,11 @@ class ContextRecallScorer(LLMJudgeScorer):
                 passed=False,
                 category=self.category,
                 explanation=(
-                    "Un-assessed: the judge listed the same reference span more "
-                    "than once, which would double-count that piece of "
-                    "information in the recall denominator. Inspect "
-                    "details.judge_response to see what the judge returned."
+                    "Un-assessed: the judge listed a reference span more times "
+                    "than the reference contains it, which would double-count "
+                    "that piece of information in the recall denominator. "
+                    "Inspect details.judge_response to see what the judge "
+                    "returned."
                 ),
                 details={
                     "skipped": "judge_parse_failure",
@@ -1444,7 +1522,11 @@ class ContextRecallScorer(LLMJudgeScorer):
         # count the same reference text as separate pieces. Either way the
         # denominator is not trustworthy, so the row is un-assessed.
         overlapping_spans, uncovered_texts = _check_reference_decomposition(
-            [item["reference_span"] for item in valid_items], expected
+            [
+                (item["reference_span"], start, end)
+                for item, (start, end) in zip(valid_items, item_intervals)
+            ],
+            expected,
         )
         if overlapping_spans:
             return ScorerResult(
@@ -1492,10 +1574,30 @@ class ContextRecallScorer(LLMJudgeScorer):
                 assessed=False,
             )
 
-        supported_count = sum(1 for item in valid_items if item["supported"])
-        recall = supported_count / len(valid_items)
+        # Adjacent pieces sharing a verdict are merged into maximal stretches
+        # of the reference before scoring: the score depends on which parts of
+        # the reference are supplied, not on how the judge happened to
+        # partition it. Two replies that make the same supported /
+        # not-supported claim over the reference -- one listing a whole
+        # sentence, the other splitting it into words -- score identically,
+        # because the decomposition check has already pinned every gap between
+        # bound pieces to whitespace.
+        ordered: list[tuple[tuple[int, int], bool]] = sorted(
+            zip(item_intervals, (bool(item["supported"]) for item in valid_items))
+        )
+        total_regions = 0
+        supported_regions = 0
+        previous_supported: bool | None = None
+        for _interval, supported_flag in ordered:
+            if supported_flag != previous_supported:
+                total_regions += 1
+                if supported_flag:
+                    supported_regions += 1
+            previous_supported = supported_flag
+
+        recall = supported_regions / total_regions
         explanation = (
-            f"{supported_count} of {len(valid_items)} reference piece(s) "
+            f"{supported_regions} of {total_regions} reference region(s) "
             f"supplied; recall {recall:.2f}, threshold {self.threshold}."
         )
 
@@ -1510,8 +1612,8 @@ class ContextRecallScorer(LLMJudgeScorer):
                 "max_score": 1,
                 "judge_model": self.model,
                 "reference_items": valid_items,
-                "supported_items": supported_count,
-                "total_items": len(valid_items),
+                "supported_regions": supported_regions,
+                "total_regions": total_regions,
                 "unverified_support_items": unverified_support_items,
                 "discarded_items": discarded_items,
                 "judge_score": judge_score,

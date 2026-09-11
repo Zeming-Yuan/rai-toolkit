@@ -210,6 +210,79 @@ def test_precision_identical_chunks_both_needed_are_demoted() -> None:
     ]
 
 
+def test_precision_duplicate_grouping_ignores_source_labels() -> None:
+    # The same passage retrieved under two source IDs is the same information
+    # twice: grouping must strip the leading [source-id] label, so both
+    # copies marked needed are corrected instead of scoring perfect precision.
+    scorer = _precision_scorer(
+        {
+            "score": 3,
+            "explanation": "Both chunks state the figure.",
+            "chunk_verdicts": [
+                {"chunk_index": 0, "needed": "needed", "reason": "States the figure."},
+                {"chunk_index": 1, "needed": "needed", "reason": "Also states it."},
+            ],
+        }
+    )
+
+    scorer.threshold = 0.7
+    result = scorer.score(
+        "Revenue was $10M.",
+        input="What was the revenue?",
+        context="[doc-1] Revenue was $10M.\n\n[doc-2] Revenue was $10M.",
+    )
+
+    assert result.assessed
+    assert result.score == 0.5
+    assert result.details["needed_chunks"] == 1
+    assert result.details["chunk_verdicts"][0]["needed"] == "needed"
+    assert result.details["chunk_verdicts"][1]["needed"] == "not_needed"
+    assert result.details["duplicate_chunk_corrections"] == [
+        {
+            "chunk_index": 1,
+            "duplicate_of": 0,
+            "reason": (
+                "Exact duplicate of chunk 0; the lowest-index chunk "
+                "supplies the information."
+            ),
+        }
+    ]
+
+
+def test_precision_lowest_index_rule_is_enforced_both_ways() -> None:
+    # The judge contradicts the lowest-index rule: the first copy is marked
+    # not_needed while the second is marked needed. Resolving the group to
+    # the documented rule -- the lowest-index copy supplies the information
+    # -- scores 0.5; demoting only the second copy would zero the score.
+    scorer = _precision_scorer(
+        {
+            "score": 1,
+            "explanation": "The duplicate is redundant.",
+            "chunk_verdicts": [
+                {"chunk_index": 0, "needed": "not_needed", "reason": "Redundant."},
+                {"chunk_index": 1, "needed": "needed", "reason": "States the figure."},
+            ],
+        }
+    )
+
+    scorer.threshold = 0.7
+    result = scorer.score(
+        "Revenue was $10M.",
+        input="What was the revenue?",
+        context="Revenue was $10M --- Revenue was $10M",
+    )
+
+    assert result.assessed
+    assert result.score == 0.5
+    assert result.details["needed_chunks"] == 1
+    assert result.details["chunk_verdicts"][0]["needed"] == "needed"
+    assert result.details["chunk_verdicts"][1]["needed"] == "not_needed"
+    assert [
+        (correction["chunk_index"], correction["duplicate_of"])
+        for correction in result.details["duplicate_chunk_corrections"]
+    ] == [(0, 0), (1, 0)]
+
+
 def test_precision_no_chunks_needed_scores_zero() -> None:
     scorer = _precision_scorer(
         {
@@ -635,9 +708,10 @@ def test_recall_all_items_supported_scores_one() -> None:
     assert result.assessed
     assert result.score == 1.0
     assert result.passed
-    # Adjacent supported pieces merge into one supplied region.
-    assert result.details["supported_regions"] == 1
-    assert result.details["total_regions"] == 1
+    # Both supplied sentences merge into one supported stretch covering the
+    # whole 40-character reference.
+    assert result.details["supported_span_length"] == 40
+    assert result.details["total_span_length"] == 40
 
 
 def test_recall_missing_item_reduces_score() -> None:
@@ -677,13 +751,14 @@ def test_recall_missing_item_reduces_score() -> None:
     )
 
     assert result.assessed
-    assert result.score == 1 / 2
+    assert result.score == 24 / 66
     assert not result.passed
-    # The two unsupported sentences are adjacent, so they merge into one
-    # unsupplied region: the judge could equally have listed them as a single
-    # piece, and the score must not depend on that choice.
-    assert result.details["supported_regions"] == 1
-    assert result.details["total_regions"] == 2
+    # The two unsupported sentences merge into one unsupplied stretch: the
+    # judge could equally have listed them as a single piece, and the score
+    # must not depend on that choice. The supplied sentence is weighed by
+    # its 24 characters against the 66 the pieces cover.
+    assert result.details["supported_span_length"] == 24
+    assert result.details["total_span_length"] == 66
 
 
 def test_recall_score_is_invariant_to_equivalent_splits() -> None:
@@ -758,9 +833,12 @@ def test_recall_score_is_invariant_to_equivalent_splits() -> None:
 
     assert sentence_level.assessed
     assert word_level.assessed
-    assert sentence_level.score == word_level.score == 0.5
-    assert sentence_level.details["total_regions"] == 2
-    assert word_level.details["total_regions"] == 2
+    # 17 of the 31 covered reference characters are supplied: the word-level
+    # split merges back into the same supported stretch, so both replies
+    # weigh the same supplied length against the same total.
+    assert sentence_level.score == word_level.score == 17 / 31
+    assert sentence_level.details["total_span_length"] == 31
+    assert word_level.details["total_span_length"] == 31
 
 
 def test_recall_no_items_supported_scores_zero() -> None:
@@ -884,7 +962,7 @@ def test_recall_fabricated_reference_span_is_discarded() -> None:
 
     assert result.assessed
     assert result.details["discarded_items"] == 1
-    assert result.details["total_regions"] == 1
+    assert result.details["total_span_length"] == 15
     assert result.score == 1.0
 
 
@@ -958,7 +1036,7 @@ def test_recall_unverifiable_context_span_downgrades_to_not_supported() -> None:
     assert result.assessed
     assert result.score == 0.0
     assert result.details["unverified_support_items"] == 1
-    assert result.details["supported_regions"] == 0
+    assert result.details["supported_span_length"] == 0
     assert result.details["reference_items"][0]["supported"] is False
 
 
@@ -1222,8 +1300,52 @@ def test_recall_repeated_sentence_scored_per_occurrence() -> None:
 
     assert result.assessed
     assert result.score == 0.5
-    assert result.details["supported_regions"] == 1
-    assert result.details["total_regions"] == 2
+    assert result.details["supported_span_length"] == 12
+    assert result.details["total_span_length"] == 24
+
+
+def test_recall_falls_as_missing_facts_grow() -> None:
+    # One supplied fact followed by one, three, and ten distinct unsupported
+    # facts: the score must fall as the unsupplied information grows. A count
+    # of same-verdict runs would return 0.5 for every one of these rows.
+    missing_facts = [f"Unrelated fact {number}." for number in range(1, 11)]
+    scores: list[float] = []
+    for count in (1, 3, 10):
+        scorer = _recall_scorer(
+            {
+                "score": 2,
+                "explanation": "Only the revenue was retrieved.",
+                "reference_items": [
+                    {
+                        "reference_span": "Revenue was $10 million.",
+                        "supported": True,
+                        "context_span": "Revenue was $10 million.",
+                        "reason": "Supplied verbatim.",
+                    },
+                    *(
+                        {
+                            "reference_span": fact,
+                            "supported": False,
+                            "context_span": "",
+                            "reason": "Not in the retrieved chunks.",
+                        }
+                        for fact in missing_facts[:count]
+                    ),
+                ],
+            }
+        )
+
+        result = scorer.score(
+            "Revenue was $10 million.",
+            input="What was the revenue?",
+            context="[doc-1] Revenue was $10 million.",
+            expected="Revenue was $10 million. " + " ".join(missing_facts[:count]),
+        )
+
+        assert result.assessed
+        scores.append(result.score)
+
+    assert scores[0] > scores[1] > scores[2]
 
 
 def test_recall_omitted_fact_is_a_parse_failure() -> None:
@@ -1380,7 +1502,7 @@ def test_recall_non_dict_items_are_discarded() -> None:
 
     assert result.assessed
     assert result.details["discarded_items"] == 2
-    assert result.details["total_regions"] == 1
+    assert result.details["total_span_length"] == 15
 
 
 def test_recall_non_object_json_reply_is_controlled_unassessed() -> None:

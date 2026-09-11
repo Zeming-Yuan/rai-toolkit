@@ -983,9 +983,16 @@ class ContextPrecisionScorer(LLMJudgeScorer):
     information is the needed one, and every later chunk repeating it is not
     needed, so identical chunks cannot both be marked needed. Exact
     duplicates are mechanically decidable, so the scorer enforces that rule
-    itself: a later exact duplicate of an earlier chunk is demoted to
-    ``not_needed`` even when the judge marked it needed, and every demotion
-    is recorded in ``details["duplicate_chunk_corrections"]``.
+    itself: within a group of identical chunks, if any copy is marked needed
+    the lowest-index copy is the one that supplies the information -- a later
+    copy marked needed is demoted to ``not_needed``, and a lowest-index copy
+    marked ``not_needed`` while a later copy is needed is promoted to
+    ``needed`` -- and every correction is recorded in
+    ``details["duplicate_chunk_corrections"]``. A group no copy is needed in
+    stays as judged: the information being supplied twice does not make it
+    needed once. Chunks are grouped by their passage content without the
+    leading ``[source-id]`` label, so the same passage retrieved under two
+    source IDs still groups as duplicates.
 
     Verdicts that are not dicts, carry a non-integer ``chunk_index``, or an
     unrecognized label are discarded and reported in
@@ -1164,15 +1171,27 @@ class ContextPrecisionScorer(LLMJudgeScorer):
 
         # Exact duplicates are mechanically decidable, so the prompt's
         # lowest-index rule is enforced here rather than trusted to the judge:
-        # within a group of chunks with identical content only the lowest
-        # index can be needed, and a later copy marked needed is demoted and
-        # recorded. Without this, a judge marking both copies of a duplicated
-        # chunk needed would score perfect precision. Chunks are grouped by
-        # whitespace-collapsed content, so delimiter padding around a ``---``
-        # fallback chunk does not hide the duplication.
+        # within a group of chunks with identical content, if any copy is
+        # marked needed the lowest-index copy is the one that supplies the
+        # information. A later copy marked needed is demoted, and a
+        # lowest-index copy marked not_needed while a later copy is needed is
+        # promoted, so the contradiction resolves to the documented rule in
+        # both verdict directions; every correction is recorded. Without this,
+        # a judge marking both copies of a duplicated chunk needed would score
+        # perfect precision, and marking the first copy not_needed with a
+        # later copy needed would zero the score instead of letting the
+        # lowest-index copy supply the information. Chunks are grouped by
+        # passage content without the leading source label, so identical
+        # passages under different source IDs still group as duplicates, and
+        # whitespace is collapsed, so delimiter padding around a ``---``
+        # fallback chunk does not hide the duplication either.
         content_groups: dict[str, list[int]] = {}
         for index in range(len(chunks)):
-            normalized_chunk = _normalized_text_with_offsets(chunks[index])[0].strip()
+            leading_label = _SOURCE_LABEL_PATTERN.match(chunks[index])
+            passage_start = leading_label.end() if leading_label else 0
+            normalized_chunk = _normalized_text_with_offsets(
+                chunks[index][passage_start:]
+            )[0].strip()
             content_groups.setdefault(normalized_chunk, []).append(index)
         needed_by_index: dict[int, str] = {
             index: str(valid_verdicts[index].get("needed"))
@@ -1180,20 +1199,29 @@ class ContextPrecisionScorer(LLMJudgeScorer):
         }
         duplicate_chunk_corrections: list[dict[str, Any]] = []
         for indexes in content_groups.values():
-            for index in indexes[1:]:
-                if needed_by_index[index] == "needed":
-                    needed_by_index[index] = "not_needed"
-                    duplicate_chunk_corrections.append(
-                        {
-                            "chunk_index": index,
-                            "duplicate_of": indexes[0],
-                            "reason": (
-                                "Exact duplicate of chunk "
-                                f"{indexes[0]}; the lowest-index chunk "
-                                "supplies the information."
-                            ),
-                        }
-                    )
+            if all(needed_by_index[index] == "not_needed" for index in indexes):
+                continue
+            for position, index in enumerate(indexes):
+                documented_label = "needed" if position == 0 else "not_needed"
+                if needed_by_index[index] == documented_label:
+                    continue
+                needed_by_index[index] = documented_label
+                duplicate_chunk_corrections.append(
+                    {
+                        "chunk_index": index,
+                        "duplicate_of": indexes[0],
+                        "reason": (
+                            "Exact duplicate of chunk "
+                            f"{indexes[0]}; the lowest-index chunk "
+                            "supplies the information."
+                        )
+                        if position > 0
+                        else (
+                            "Lowest-index copy of an exact-duplicate group; "
+                            "the lowest-index chunk supplies the information."
+                        ),
+                    }
+                )
 
         needed_count = sum(1 for label in needed_by_index.values() if label == "needed")
         precision = needed_count / len(chunks)
@@ -1268,14 +1296,19 @@ class ContextRecallScorer(LLMJudgeScorer):
       omitting the pieces the retrieval missed -- a two-fact reference where
       only the supported fact is listed would score a perfect recall.
 
-    The score is ``supported regions / regions``, derived from the validated
-    pieces: adjacent pieces sharing a verdict are merged into maximal stretches
-    of the reference first, so the score depends on which parts of the
-    reference are supplied, not on how the judge happened to partition it --
-    two replies that make the same supported / not-supported claim over the
-    reference score identically. The judge's own overall score is advisory and
-    recorded in ``details["judge_score"]``. A reply that yields no valid piece
-    is a parse failure rather than a perfect or empty score.
+    The score is the share of the reference text the retrieval supplied:
+    supported stretch length over total stretch length, measured on the
+    whitespace-collapsed reference the pieces are bound to. Adjacent pieces
+    sharing a verdict are merged into maximal stretches first, so splitting
+    or merging equivalent pieces leaves the stretches -- and the measured
+    lengths -- unchanged, and weighing the stretches by length is what makes
+    recall fall as more distinct reference information goes unsupplied,
+    where a count of same-verdict runs would freeze at 0.5 no matter how
+    many facts the retrieval missed. Gaps between opposite-verdict stretches
+    stay outside both, so the denominator is the stretches' own total
+    length, not the whole reference. The judge's own overall score is
+    advisory and recorded in ``details["judge_score"]``. A reply that yields
+    no valid piece is a parse failure rather than a perfect or empty score.
 
     Rows without retrieved context, with a blank query, or without a reference
     answer return ``assessed=False`` (``skipped`` is ``empty_context`` /
@@ -1574,30 +1607,36 @@ class ContextRecallScorer(LLMJudgeScorer):
                 assessed=False,
             )
 
-        # Adjacent pieces sharing a verdict are merged into maximal stretches
-        # of the reference before scoring: the score depends on which parts of
-        # the reference are supplied, not on how the judge happened to
-        # partition it. Two replies that make the same supported /
-        # not-supported claim over the reference -- one listing a whole
-        # sentence, the other splitting it into words -- score identically,
-        # because the decomposition check has already pinned every gap between
-        # bound pieces to whitespace.
-        ordered: list[tuple[tuple[int, int], bool]] = sorted(
+        # The score weighs maximal same-verdict stretches of the reference by
+        # their length on the whitespace-collapsed text: supported stretch
+        # length over total stretch length. Piece count would move with the
+        # judge's partition -- splitting one unsupported sentence into three
+        # pieces would triple the penalty -- and counting runs without their
+        # length would freeze the score at 0.5 while any number of distinct
+        # facts goes unsupplied. Measuring stretch length does neither:
+        # splitting or merging equivalent pieces leaves the stretches, and so
+        # their measured lengths, unchanged, while every additional unsupplied
+        # fact adds reference length the retrieval did not supply. Merging
+        # same-verdict neighbours first is what makes the split invariance
+        # exact: the whitespace gaps the decomposition check allows must not
+        # leak out of the measurement when a supported sentence is split into
+        # words. Gaps between opposite-verdict stretches stay outside both, so
+        # the denominator is the stretches' own length, not the whole
+        # reference.
+        stretches: list[tuple[int, int, bool]] = []
+        for interval, supported_flag in sorted(
             zip(item_intervals, (bool(item["supported"]) for item in valid_items))
-        )
-        total_regions = 0
-        supported_regions = 0
-        previous_supported: bool | None = None
-        for _interval, supported_flag in ordered:
-            if supported_flag != previous_supported:
-                total_regions += 1
-                if supported_flag:
-                    supported_regions += 1
-            previous_supported = supported_flag
+        ):
+            if stretches and stretches[-1][2] == supported_flag:
+                stretches[-1] = (stretches[-1][0], interval[1], supported_flag)
+            else:
+                stretches.append((interval[0], interval[1], supported_flag))
+        supported_length = sum(end - start for start, end, flag in stretches if flag)
+        total_length = sum(end - start for start, end, _flag in stretches)
 
-        recall = supported_regions / total_regions
+        recall = supported_length / total_length
         explanation = (
-            f"{supported_regions} of {total_regions} reference region(s) "
+            f"{supported_length} of {total_length} reference character(s) "
             f"supplied; recall {recall:.2f}, threshold {self.threshold}."
         )
 
@@ -1612,8 +1651,8 @@ class ContextRecallScorer(LLMJudgeScorer):
                 "max_score": 1,
                 "judge_model": self.model,
                 "reference_items": valid_items,
-                "supported_regions": supported_regions,
-                "total_regions": total_regions,
+                "supported_span_length": supported_length,
+                "total_span_length": total_length,
                 "unverified_support_items": unverified_support_items,
                 "discarded_items": discarded_items,
                 "judge_score": judge_score,
